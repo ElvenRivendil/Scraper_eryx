@@ -3,7 +3,9 @@
  *
  * Networking is disabled until the host calls setNetConfig(). Host policy
  * mirrors the Rust crate's NetConfig: blocked patterns are always enforced,
- * then the host must match allowedHosts unless allowAllHosts is set.
+ * then the host must match allowedHosts unless allowAllHosts is set. In Node,
+ * resolved addresses are also checked against blockedNetworks (minus
+ * allowedNetworks) unless the host matches internalHosts.
  *
  * The transport depends on the environment:
  * - Node.js: real TCP/TLS sockets (net-node.js)
@@ -33,20 +35,65 @@ export const DEFAULT_BLOCKED_HOSTS = [
   "[::1]",
 ];
 
-/** @type {{ allowAllHosts: boolean, allowedHosts: string[], blockedHosts: string[] } | null} */
+/** Same defaults as the Rust crate's `DEFAULT_BLOCKED_NETWORKS`. */
+export const DEFAULT_BLOCKED_NETWORKS = [
+  "0.0.0.0/8",
+  "10.0.0.0/8",
+  "100.64.0.0/10",
+  "127.0.0.0/8",
+  "169.254.0.0/16",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "224.0.0.0/4",
+  "240.0.0.0/4",
+  "::/128",
+  "::1/128",
+  "fc00::/7",
+  "fe80::/10",
+  "ff00::/8",
+];
+
+/**
+ * The active policy; `isAllowed` checks resolved addresses (null where the
+ * transport can't see them).
+ *
+ * @type {(Required<import("./net.js").NetConfig> & { isAllowed: ((address: string, family: number) => boolean) | null }) | null}
+ */
 let config = null;
+
+/** Strict CIDR syntax, so a typo can't parse as a wider network (`10.0.0.0/` as `/0`). */
+function checkCidrs(cidrs) {
+  for (const cidr of cidrs) {
+    const m = /^([0-9a-fA-F:.]+)\/(\d{1,3})$/.exec(cidr);
+    if (!m || Number(m[2]) > (m[1].includes(":") ? 128 : 32)) {
+      throw new TypeError(`invalid CIDR '${cidr}'`);
+    }
+  }
+  return cidrs;
+}
 
 /**
  * Enable (or, with `null`, disable) networking for sandboxed code.
  *
- * @param {{ allowAllHosts?: boolean, allowedHosts?: string[], blockedHosts?: string[] } | null} netConfig
+ * Throws a TypeError if a network is not a valid CIDR.
+ *
+ * @param {import("./net.js").NetConfig | null} netConfig
  */
 export function setNetConfig(netConfig) {
-  config = netConfig && {
+  if (!netConfig) {
+    config = null;
+    return;
+  }
+  const next = {
     allowAllHosts: netConfig.allowAllHosts ?? false,
     allowedHosts: netConfig.allowedHosts ?? [],
     blockedHosts: netConfig.blockedHosts ?? DEFAULT_BLOCKED_HOSTS,
+    blockedNetworks: checkCidrs(netConfig.blockedNetworks ?? DEFAULT_BLOCKED_NETWORKS),
+    allowedNetworks: checkCidrs(netConfig.allowedNetworks ?? []),
+    internalHosts: netConfig.internalHosts ?? [],
   };
+  // Only the Node transport sees resolved addresses.
+  config = { ...next, isAllowed: transport.networkFilter?.(next) ?? null };
 }
 
 /** Glob match with `*` wildcards, case-insensitive (like the Rust matcher). */
@@ -73,7 +120,9 @@ export const tcp = {
   ...transport.tcp,
   async connect(host, port, timeoutMs) {
     checkHost(host);
-    return transport.tcp.connect(host, port, timeoutMs);
+    // The transport checks resolved addresses with this; internal hosts skip it.
+    const internal = config.internalHosts.some((p) => hostMatches(host, p));
+    return transport.tcp.connect(host, port, timeoutMs, internal ? null : config.isAllowed);
   },
 };
 

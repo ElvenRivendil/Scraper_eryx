@@ -9,8 +9,12 @@ import { Sandbox, setNetConfig } from "@bsull/eryx";
 import { tcp as fetchTcp } from "../eryx/shims/net-fetch.js";
 
 const sandbox = new Sandbox();
-// Tests talk to 127.0.0.1, which the default blocklist refuses.
-const allowLoopback = { allowedHosts: ["127.0.0.1"], blockedHosts: [] };
+// Tests talk to 127.0.0.1, which the default blocklists refuse.
+const allowLoopback = {
+  allowedHosts: ["127.0.0.1"],
+  blockedHosts: [],
+  allowedNetworks: ["127.0.0.0/8"],
+};
 
 describe("network policy", () => {
   afterEach(() => setNetConfig(null));
@@ -37,6 +41,22 @@ except OSError as e:
     setNetConfig({ allowAllHosts: true });
     expect((await tryConnect("127.0.0.1")).stdout).toContain("is blocked");
   });
+
+  it("blocks private addresses that pass the host patterns", async () => {
+    setNetConfig({ allowAllHosts: true, blockedHosts: [] });
+    expect((await tryConnect("127.0.0.1")).stdout).toContain("resolves to a blocked network");
+    // A name is checked by what it resolves to, not how it is spelled.
+    expect((await tryConnect("localhost")).stdout).toContain("resolves to a blocked network");
+    // NAT64 addresses are checked by the IPv4 address they embed.
+    expect((await tryConnect("64:ff9b::a9fe:a9fe")).stdout).toContain("resolves to a blocked network");
+  });
+
+  it("rejects malformed CIDRs up front", () => {
+    // `Number("")` is 0: unchecked, this would exempt every IPv4 address.
+    expect(() => setNetConfig({ allowedNetworks: ["10.0.0.0/"] })).toThrow("invalid CIDR '10.0.0.0/'");
+    expect(() => setNetConfig({ blockedNetworks: ["10.0.0.0/33"] })).toThrow(TypeError);
+    expect(() => setNetConfig({ blockedNetworks: ["not-an-ip/8"] })).toThrow();
+  });
 });
 
 describe("Node socket transport", () => {
@@ -57,6 +77,22 @@ describe("Node socket transport", () => {
   afterAll(() => {
     setNetConfig(null);
     server.close();
+  });
+
+  it("lets internalHosts resolve to blocked networks", async () => {
+    setNetConfig({ allowAllHosts: true, blockedHosts: [], internalHosts: ["localhost"] });
+    try {
+      const result = await sandbox.execute(`
+import socket
+s = socket.create_connection(("localhost", ${port}))
+s.sendall(b"internal")
+print(s.recv(100).decode())
+s.close()
+`);
+      expect(result.stdout).toBe("INTERNAL\n");
+    } finally {
+      setNetConfig(allowLoopback);
+    }
   });
 
   it("round-trips over a real TCP socket", async () => {

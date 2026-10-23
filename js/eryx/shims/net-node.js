@@ -1,6 +1,7 @@
 /**
  * Node.js transport for the eryx:net shims: real TCP/TLS via node:net and
- * node:tls. Policy checks happen in net.js before this is reached.
+ * node:tls. Host policy is checked in net.js; the resolved-address check
+ * happens here, since only the transport sees the address it connects to.
  */
 
 const conns = new Map();
@@ -42,6 +43,7 @@ function mapTcpError(e) {
     case "ETIMEDOUT": return { tag: "timed-out" };
     case "ENOTFOUND":
     case "EAI_AGAIN": return { tag: "host-not-found" };
+    case "EERYX_BLOCKED": return { tag: "not-permitted", val: e.message };
     default: return { tag: "io-error", val: String(e?.message ?? e) };
   }
 }
@@ -75,11 +77,77 @@ function close(h) {
   untrack(h)?.socket.destroy();
 }
 
+// Synchronous so net.js can build (and so validate) the filter in setNetConfig.
+const net = await import(/* webpackIgnore: true */ "node:net");
+const dns = await import(/* webpackIgnore: true */ "node:dns");
+
+// The address stays out of the message: telling the guest would let it map
+// internal DNS names to addresses.
+function blockedError(host) {
+  const e = new Error(`host '${host}' resolves to a blocked network`);
+  e.code = "EERYX_BLOCKED";
+  return e;
+}
+
+/**
+ * The IPv4 address a well-known-prefix NAT64 address (`64:ff9b::a.b.c.d`,
+ * RFC 6052) is translated to, in the compressed form `dns.lookup` returns.
+ */
+function nat64ToIPv4(address) {
+  const m = /^64:ff9b::(?:([0-9a-f]{1,4}):)?([0-9a-f]{1,4})$/i.exec(address);
+  if (!m) return null;
+  const hi = parseInt(m[1] ?? "0", 16);
+  const lo = parseInt(m[2], 16);
+  return [hi >> 8, hi & 255, lo >> 8, lo & 255].join(".");
+}
+
+/**
+ * `(address, family) => allowed` for `blockedNetworks` minus `allowedNetworks`.
+ * CIDR syntax is checked by net.js; BlockList throws on a bad address or prefix.
+ */
+export function networkFilter({ blockedNetworks, allowedNetworks }) {
+  const list = (cidrs) => {
+    const bl = new net.BlockList();
+    for (const cidr of cidrs) {
+      const [addr, prefix] = cidr.split("/");
+      bl.addSubnet(addr, Number(prefix), net.isIPv6(addr) ? "ipv6" : "ipv4");
+    }
+    return bl;
+  };
+  const blocked = list(blockedNetworks);
+  const allowed = list(allowedNetworks);
+  // BlockList already matches IPv4-mapped IPv6 addresses against IPv4 subnets.
+  const matches = (bl, address, type) => {
+    const v4 = type === "ipv6" ? nat64ToIPv4(address) : null;
+    return bl.check(address, type) || (v4 !== null && bl.check(v4, "ipv4"));
+  };
+  return (address, family) => {
+    const type = family === 6 ? "ipv6" : "ipv4";
+    return !matches(blocked, address, type) || matches(allowed, address, type);
+  };
+}
+
 export const tcp = {
-  async connect(host, port, _timeoutMs) {
-    const net = await import(/* webpackIgnore: true */ "node:net");
+  /** `isAllowed` is a networkFilter() result, or null to skip the address check. */
+  async connect(host, port, _timeoutMs, isAllowed) {
+    isAllowed ??= () => true;
+    // Node skips `lookup` for IP literals, so check those here.
+    const literal = net.isIP(host);
+    if (literal && !isAllowed(host, literal)) {
+      throw tcpErr(mapTcpError(blockedError(host)));
+    }
+    // Filter the DNS answer before Node picks an address, so the address
+    // connected to is one that was checked.
+    const lookup = (hostname, options, cb) =>
+      dns.lookup(hostname, { ...options, all: true }, (err, addrs) => {
+        if (err) return cb(err);
+        const ok = addrs.filter((a) => isAllowed(a.address, a.family));
+        if (!ok.length) return cb(blockedError(hostname));
+        if (options.all) return cb(null, ok);
+        cb(null, ok[0].address, ok[0].family);
+      });
     return new Promise((resolve, reject) => {
-      const s = net.connect({ host, port });
+      const s = net.connect({ host, port, lookup });
       s.once("connect", () => { s.off("error", reject); resolve(track(s)); });
       s.once("error", (e) => reject(tcpErr(mapTcpError(e))));
     });
