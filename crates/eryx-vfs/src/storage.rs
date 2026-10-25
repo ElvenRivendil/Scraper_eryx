@@ -98,6 +98,20 @@ pub trait VfsStorage: Send + Sync {
     /// Rename/move a file or directory.
     async fn rename(&self, from: &str, to: &str) -> VfsResult<()>;
 
+    /// Set the access and/or modification time of a file or directory;
+    /// `None` leaves that time unchanged.
+    ///
+    /// The default implementation reports the operation as unsupported.
+    async fn set_times(
+        &self,
+        path: &str,
+        accessed: Option<SystemTime>,
+        modified: Option<SystemTime>,
+    ) -> VfsResult<()> {
+        let _ = (accessed, modified);
+        Err(VfsError::Unsupported(format!("set_times: {path}")))
+    }
+
     /// Synchronously create a directory.
     ///
     /// This is useful for setup code that runs before the async runtime
@@ -192,6 +206,15 @@ impl VfsStorage for ArcStorage {
 
     async fn rename(&self, from: &str, to: &str) -> VfsResult<()> {
         self.0.rename(from, to).await
+    }
+
+    async fn set_times(
+        &self,
+        path: &str,
+        accessed: Option<SystemTime>,
+        modified: Option<SystemTime>,
+    ) -> VfsResult<()> {
+        self.0.set_times(path, accessed, modified).await
     }
 
     fn mkdir_sync(&self, path: &str) -> VfsResult<()> {
@@ -335,7 +358,7 @@ impl InMemoryStorage {
     }
 
     /// Normalize a path (remove trailing slashes, handle . and ..).
-    fn normalize_path(path: &str) -> VfsResult<String> {
+    pub(crate) fn normalize_path(path: &str) -> VfsResult<String> {
         if !path.starts_with('/') {
             return Err(VfsError::InvalidPath(format!(
                 "path must be absolute: {path}"
@@ -418,6 +441,12 @@ impl InMemoryStorage {
                 "{path}: {new_len} bytes exceeds host addressable size"
             ))
         })
+    }
+
+    /// Hold the storage lock, so tests can exercise contention.
+    #[cfg(test)]
+    pub(crate) async fn hold_lock(&self) -> impl Drop + '_ {
+        self.state.read().await
     }
 
     /// Check if parent directory exists (requires state to already be borrowed).
@@ -763,6 +792,12 @@ impl VfsStorage for InMemoryStorage {
 
         // Handle directory rename
         if state.directories.contains(&from) {
+            if from == "/" {
+                return Err(VfsError::PermissionDenied(
+                    "cannot rename root directory".to_string(),
+                ));
+            }
+
             // Check destination doesn't exist as file
             if state.files.contains_key(&to) {
                 return Err(VfsError::AlreadyExists(to));
@@ -771,6 +806,22 @@ impl VfsStorage for InMemoryStorage {
             // Rename directory and all contents
             let from_prefix = format!("{from}/");
             let to_prefix = format!("{to}/");
+
+            // A directory can't be moved inside itself: the subtree would be
+            // detached from the tree but keep its contents.
+            if to.starts_with(&from_prefix) {
+                return Err(VfsError::InvalidPath(format!(
+                    "cannot move {from} into its own subdirectory {to}"
+                )));
+            }
+
+            // An existing destination directory may only be replaced if empty.
+            if state.directories.contains(&to)
+                && (state.files.keys().any(|p| p.starts_with(&to_prefix))
+                    || state.directories.iter().any(|p| p.starts_with(&to_prefix)))
+            {
+                return Err(VfsError::DirectoryNotEmpty(to));
+            }
 
             // Rename files under the directory
             let files_to_rename: Vec<_> = state
@@ -809,47 +860,63 @@ impl VfsStorage for InMemoryStorage {
         Err(VfsError::NotFound(from))
     }
 
+    async fn set_times(
+        &self,
+        path: &str,
+        accessed: Option<SystemTime>,
+        modified: Option<SystemTime>,
+    ) -> VfsResult<()> {
+        let path = Self::normalize_path(path)?;
+        let mut state = self.state.write().await;
+        if let Some(file) = state.files.get_mut(&path) {
+            if let Some(t) = accessed {
+                file.accessed = t;
+            }
+            if let Some(t) = modified {
+                file.modified = t;
+            }
+            Ok(())
+        } else if state.directories.contains(&path) {
+            // Directories don't store timestamps (stat reports none), so
+            // there is nothing to update.
+            Ok(())
+        } else {
+            Err(VfsError::NotFound(path))
+        }
+    }
+
     fn mkdir_sync(&self, path: &str) -> VfsResult<()> {
         let path = Self::normalize_path(path)?;
 
-        // Collect all directories to create first.
-        let mut dirs_to_create = Vec::new();
-        let mut current = String::new();
-        for component in path.split('/').filter(|s| !s.is_empty()) {
-            current = format!("{}/{}", current, component);
-            dirs_to_create.push(current.clone());
-        }
-
-        // Try to acquire the lock without blocking first.
-        // This handles the common case where no contention exists.
-        if let Ok(mut state) = self.state.try_write() {
-            for dir in dirs_to_create {
-                state.directories.insert(dir);
-            }
-            return Ok(());
-        }
-
-        // If try_write fails, we need to use a blocking approach.
-        // Check if we're in an async runtime context.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            // We're in an async runtime - use block_on with async write.
-            // This is safe because mkdir_sync is only called during setup,
-            // before the store starts processing async WASM calls.
-            handle.block_on(async {
-                let mut state = self.state.write().await;
-                for dir in dirs_to_create {
-                    state.directories.insert(dir);
+        // Creates every missing ancestor, like `mkdir -p`.
+        let create_all = |state: &mut StorageState| {
+            let mut current = String::new();
+            for component in path.split('/').filter(|s| !s.is_empty()) {
+                current = format!("{current}/{component}");
+                if state.files.contains_key(&current) {
+                    return Err(VfsError::NotDirectory(current));
                 }
-            });
-        } else {
-            // Not in an async runtime - safe to use blocking_write.
-            let mut state = self.state.blocking_write();
-            for dir in dirs_to_create {
-                state.directories.insert(dir);
+                state.directories.insert(current.clone());
             }
+            Ok(())
+        };
+
+        // Uncontended: take the lock without blocking.
+        if let Ok(mut state) = self.state.try_write() {
+            return create_all(&mut state);
         }
 
-        Ok(())
+        // `blocking_write` panics when called from inside a tokio runtime, so
+        // in that case wait for the lock on a separate thread.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::scope(|s| {
+                s.spawn(|| create_all(&mut self.state.blocking_write()))
+                    .join()
+                    .unwrap_or_else(|e| std::panic::resume_unwind(e))
+            })
+        } else {
+            create_all(&mut self.state.blocking_write())
+        }
     }
 }
 
@@ -931,6 +998,43 @@ mod tests {
         // Shrinking is always allowed.
         storage.set_size("/f", 0).await.unwrap();
         assert_eq!(storage.stat("/f").await.unwrap().size, 0);
+    }
+
+    #[tokio::test]
+    async fn rename_dir_into_own_subdirectory_is_refused() {
+        let storage = InMemoryStorage::new();
+        storage.mkdir("/a").await.unwrap();
+        storage.write("/a/f", b"x").await.unwrap();
+
+        let err = storage.rename("/a", "/a/b").await.unwrap_err();
+        assert!(matches!(err, VfsError::InvalidPath(_)), "{err:?}");
+        assert_eq!(storage.read("/a/f").await.unwrap(), b"x");
+    }
+
+    #[tokio::test]
+    async fn rename_dir_onto_dir_requires_empty_target() {
+        let storage = InMemoryStorage::new();
+        storage.mkdir("/a").await.unwrap();
+        storage.write("/a/f", b"from").await.unwrap();
+        storage.mkdir("/b").await.unwrap();
+        storage.write("/b/f", b"to").await.unwrap();
+
+        let err = storage.rename("/a", "/b").await.unwrap_err();
+        assert!(matches!(err, VfsError::DirectoryNotEmpty(_)), "{err:?}");
+        assert_eq!(storage.read("/b/f").await.unwrap(), b"to");
+
+        storage.delete("/b/f").await.unwrap();
+        storage.rename("/a", "/b").await.unwrap();
+        assert_eq!(storage.read("/b/f").await.unwrap(), b"from");
+        assert!(!storage.exists("/a").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn rename_root_is_refused() {
+        let storage = InMemoryStorage::new();
+        storage.mkdir("/a").await.unwrap();
+        let err = storage.rename("/", "/a").await.unwrap_err();
+        assert!(matches!(err, VfsError::PermissionDenied(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -1152,6 +1256,31 @@ mod tests {
         assert!(state.directories.contains("/data"));
     }
 
+    /// `blocking_write` and `Handle::block_on` both panic inside a runtime, so
+    /// a contended lock used to take the host down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mkdir_sync_waits_for_contended_lock_inside_runtime() {
+        let storage = InMemoryStorage::new();
+        let guard = storage.state.read().await;
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                drop(guard);
+            });
+            storage.mkdir_sync("/data/sub").unwrap();
+        });
+        assert!(storage.exists("/data/sub").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn mkdir_sync_refuses_to_shadow_a_file() {
+        let storage = InMemoryStorage::new();
+        storage.write("/data", b"x").await.unwrap();
+        let err = storage.mkdir_sync("/data/sub").unwrap_err();
+        assert!(matches!(err, VfsError::NotDirectory(_)), "{err:?}");
+        assert!(!storage.exists("/data/sub").await.unwrap());
+    }
+
     #[test]
     fn test_mkdir_sync_nested() {
         let storage = InMemoryStorage::new();
@@ -1164,5 +1293,19 @@ mod tests {
         assert!(state.directories.contains("/data"));
         assert!(state.directories.contains("/data/subdir"));
         assert!(state.directories.contains("/data/subdir/nested"));
+    }
+
+    #[tokio::test]
+    async fn set_times_updates_file_metadata() {
+        let storage = InMemoryStorage::new();
+        storage.write("/f", b"x").await.unwrap();
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+
+        storage.set_times("/f", None, Some(t)).await.unwrap();
+        assert_eq!(storage.stat("/f").await.unwrap().modified, t);
+        assert!(matches!(
+            storage.set_times("/missing", Some(t), None).await,
+            Err(VfsError::NotFound(_))
+        ));
     }
 }
