@@ -1047,6 +1047,24 @@ _loop.running = True
 asyncio.events._set_running_loop(_loop)
 
 
+def _asyncio_run(main, *, debug=None, loop_factory=None):
+    """Stand-in for asyncio.run(), which can't start a loop inside the sandbox.
+
+    Top-level `asyncio.run(coro)` statements are rewritten to `await coro`
+    before they run (see _eryx_compile), so this is only reached from places
+    that can't await, such as a plain function body.
+    """
+    if asyncio.iscoroutine(main):
+        main.close()
+    raise RuntimeError(
+        "asyncio.run() only works as a top-level statement in the eryx sandbox, "
+        "whose event loop is already running; use `await` instead"
+    )
+
+
+asyncio.run = _asyncio_run
+
+
 def _set_async_state(state: _AsyncState) -> None:
     _async_state.set(state)
 
@@ -1495,12 +1513,62 @@ def _eryx_add_site_packages():
     at = _sys.path.index('/python-stdlib') + 1 if '/python-stdlib' in _sys.path else 0
     _sys.path[at:at] = new
 
-def _eryx_exec(code, trace_enabled):
+class _EryxAsyncioRunRewriter(_ast.NodeTransformer):
+    '''Rewrite top-level `asyncio.run(coro)` calls into `await coro`.
+
+    The sandbox's event loop is already running, so the real asyncio.run()
+    refuses to start. At the top level, where await is allowed, the call can
+    simply await the coroutine on the running loop instead. Function, class,
+    lambda and comprehension bodies are left alone: asyncio.run() there hits
+    the shim in _eryx_async, which explains the limitation.
+    '''
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        func = node.func
+        if (isinstance(func, _ast.Attribute) and func.attr == 'run'
+                and isinstance(func.value, _ast.Name) and func.value.id == 'asyncio'
+                and len(node.args) == 1 and not isinstance(node.args[0], _ast.Starred)
+                and all(k.arg == 'debug' for k in node.keywords)):
+            return _ast.copy_location(_ast.Await(node.args[0]), node)
+        return node
+
+    def _skip(self, node):
+        return node
+
+    visit_FunctionDef = visit_AsyncFunctionDef = visit_ClassDef = visit_Lambda = _skip
+    visit_ListComp = visit_SetComp = visit_DictComp = visit_GeneratorExp = _skip
+
+def _eryx_compile(code, filename):
+    '''Compile a unit of code with top-level await support.'''
+    source = code
+    # Only parse ahead of compile() for code that might call asyncio.run().
+    if 'asyncio' in code and '.run' in code:
+        source = _EryxAsyncioRunRewriter().visit(_ast.parse(code, filename))
+    return compile(source, filename, 'exec', flags=_ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+
+def _eryx_start(compiled):
+    '''Run a compiled unit in the user namespace, returning a coroutine if it awaits.'''
+    if compiled.co_flags & 0x80:  # CO_COROUTINE
+        return _types.FunctionType(compiled, _eryx_user_globals)()
+    exec(compiled, _eryx_user_globals, _eryx_user_globals)
+
+async def _eryx_run_units(units):
+    '''Run compiled units in order on the event loop.'''
+    for compiled in units:
+        coro = _eryx_start(compiled)
+        if coro is not None:
+            await coro
+
+def _eryx_exec(code, trace_enabled, preamble):
     '''Execute user code efficiently. Called once per execute().
 
     This function is pre-compiled and runs user code in its own namespace, so
     infrastructure variables (_eryx_*) don't clutter the user's globals. They
     are not hidden: user code can still reach them via `import __main__`.
+
+    The host's preamble (libraries, secrets) is compiled as its own unit and
+    runs first, so line numbers in the user code's tracebacks match the code
+    the user wrote.
     '''
     global _eryx_callback_code
     _eryx_callback_code = 0
@@ -1517,24 +1585,24 @@ def _eryx_exec(code, trace_enabled):
     _sys.stdout = _eryx_stdout
     _sys.stderr = _eryx_stderr
 
-    # Compile user code with top-level await support
-    compiled = compile(code, '<user>', 'exec', flags=_ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+    units = [_eryx_compile(code, '<user>')]
+    if preamble:
+        units.insert(0, _eryx_compile(preamble, '<preamble>'))
 
     # Callback trace events are emitted independently by invoke and are
     # unaffected by this Python line/call/return/exception tracing switch.
     if trace_enabled:
         _sys.settrace(_eryx_trace_func)
 
-    # Check if the compiled code is a coroutine (has top-level await)
-    if compiled.co_flags & 0x80:  # CO_COROUTINE
+    if any(c.co_flags & 0x80 for c in units):  # CO_COROUTINE
         # _eryx_async stops tracing once the execution finishes, which is after
         # this returns if it suspends on a callback.
-        fn = _types.FunctionType(compiled, _eryx_user_globals)
-        _eryx_run_async(fn())
+        _eryx_run_async(_eryx_start(units[0]) if len(units) == 1 else _eryx_run_units(units))
         return
     try:
         # Regular synchronous code - execute in user namespace
-        exec(compiled, _eryx_user_globals, _eryx_user_globals)
+        for compiled in units:
+            exec(compiled, _eryx_user_globals, _eryx_user_globals)
     except SystemExit as e:
         if not _eryx_async.is_success_exit(e):
             raise
@@ -2955,26 +3023,36 @@ impl ExecHelpers {
         }
     }
 
-    /// Call `_eryx_exec(code, trace_enabled)`. Returns `false` if it raised, in
-    /// which case the traceback has been printed to the (redirected) stderr.
-    unsafe fn exec(&self, code: &str, trace_enabled: bool) -> Result<bool, String> {
+    /// Call `_eryx_exec(code, trace_enabled, preamble)`. Returns `false` if it
+    /// raised, in which case the traceback has been printed to the (redirected)
+    /// stderr.
+    unsafe fn exec(&self, code: &str, trace_enabled: bool, preamble: &str) -> Result<bool, String> {
         unsafe {
             let code_obj = PyUnicode_FromStringAndSize(code.as_ptr().cast(), code.len() as isize);
             if code_obj.is_null() {
                 PyErr_Clear();
                 return Err("Invalid code string".to_string());
             }
+            let preamble_obj =
+                PyUnicode_FromStringAndSize(preamble.as_ptr().cast(), preamble.len() as isize);
+            if preamble_obj.is_null() {
+                Py_DecRef(code_obj);
+                PyErr_Clear();
+                return Err("Invalid preamble string".to_string());
+            }
             let trace_obj = PyBool_FromLong(std::ffi::c_long::from(trace_enabled));
-            let args = PyTuple_New(2);
+            let args = PyTuple_New(3);
             if args.is_null() {
                 Py_DecRef(code_obj);
+                Py_DecRef(preamble_obj);
                 Py_DecRef(trace_obj);
                 PyErr_Clear();
                 return Err("Failed to allocate arguments".to_string());
             }
-            // PyTuple_SetItem steals both references.
+            // PyTuple_SetItem steals the references.
             PyTuple_SetItem(args, 0, code_obj);
             PyTuple_SetItem(args, 1, trace_obj);
+            PyTuple_SetItem(args, 2, preamble_obj);
             let ret = PyObject_Call(self.exec, args, std::ptr::null_mut());
             Py_DecRef(args);
             if ret.is_null() {
@@ -2998,6 +3076,27 @@ fn format_execution_error(stderr_output: &[u8], exception_msg: String) -> String
     }
 }
 
+/// First line of framed code: `#eryx-preamble:<len>`, followed by the host
+/// preamble (`<len>` bytes, possibly none) and then the user code. Compiling
+/// the two separately keeps the user code's line numbers. Hosts frame every
+/// execution and only one leading header is split off, so a header-like first
+/// line in user code stays user code. Must match the host's framing.
+const PREAMBLE_HEADER: &str = "#eryx-preamble:";
+
+/// Split `code` into `(preamble, user_code)` per [`PREAMBLE_HEADER`].
+///
+/// Only one leading header is split off; code without a well-formed header
+/// (from a host that doesn't frame) is all user code, with no preamble.
+fn split_preamble(code: &str) -> (&str, &str) {
+    code.strip_prefix(PREAMBLE_HEADER)
+        .and_then(|rest| {
+            let (len, rest) = rest.split_once('\n')?;
+            let len: usize = len.parse().ok()?;
+            Some((rest.get(..len)?, rest.get(len..)?))
+        })
+        .unwrap_or(("", code))
+}
+
 /// [`execute_python`] without re-parsing any Python source except the user's.
 ///
 /// # Safety
@@ -3007,8 +3106,9 @@ unsafe fn execute_python_direct(
     code: &str,
     trace_enabled: bool,
 ) -> ExecuteResult {
+    let (preamble, code) = split_preamble(code);
     unsafe {
-        match helpers.exec(code, trace_enabled) {
+        match helpers.exec(code, trace_enabled, preamble) {
             Err(e) => return ExecuteResult::Error(e),
             Ok(false) => {
                 let (_, stderr_output) = helpers.get_output();
@@ -3210,6 +3310,8 @@ unsafe fn set_python_variable_bytes(name: &str, data: &[u8]) -> Result<(), Strin
 /// - Imported modules (they remain in the session, but aren't serialized)
 /// - Callback infrastructure (re-created on each session)
 /// - Generator/coroutine objects (live iterators with frame state)
+///
+/// Variables that cannot be serialized are left out without notice.
 pub fn snapshot_state() -> Result<Vec<u8>, String> {
     if !is_python_initialized() {
         return Err("Python not initialized".to_string());
@@ -3248,9 +3350,11 @@ def _eryx_is_callback_obj(obj):
 # Take a snapshot of the keys first to avoid 'dictionary changed size during iteration'
 _eryx_keys = list(_eryx_user_globals.keys())
 
-# Build dict of serializable items
+# Build dict of serializable items. Names that can't be serialized are kept in
+# _eryx_snapshot_skipped (not printed: no execution's output is being captured
+# here, so a notice could only go to the host process's stderr).
 _eryx_state_dict = {}
-_eryx_skipped = []
+_eryx_snapshot_skipped = []
 for _k in _eryx_keys:
     if _k not in _eryx_exclude and not _k.startswith('_eryx_'):
         _v = _eryx_user_globals.get(_k)
@@ -3263,19 +3367,13 @@ for _k in _eryx_keys:
             _eryx_state_dict[_k] = _v
         except Exception:
             # Skip items dill can't serialize (modules, open handles, etc.)
-            _eryx_skipped.append(_k)
-
-if _eryx_skipped:
-    import sys as _eryx_sys
-    print('eryx: snapshot skipped variables that cannot be serialized: '
-          + ', '.join(_eryx_skipped), file=_eryx_sys.__stderr__)
-    del _eryx_sys
+            _eryx_snapshot_skipped.append(_k)
 
 # Serialize the filtered dict with dill
 _eryx_state_bytes = _eryx_dill.dumps(_eryx_state_dict)
 
 # Clean up local helpers
-del _eryx_exclude, _eryx_is_callback_obj, _eryx_keys, _eryx_state_dict, _eryx_skipped, _eryx_dill
+del _eryx_exclude, _eryx_is_callback_obj, _eryx_keys, _eryx_state_dict, _eryx_dill
 ";
 
         run_in_main(pickle_code).map_err(|err| format!("Failed to snapshot state: {err}"))?;
@@ -3746,7 +3844,34 @@ pub fn escape_json_string(s: &str) -> String {
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "tests fail loudly on malformed output")]
 mod tests {
-    use super::escape_json_string;
+    use super::{escape_json_string, split_preamble};
+
+    #[test]
+    fn split_preamble_reads_the_host_framing() {
+        assert_eq!(
+            split_preamble("#eryx-preamble:5\nx = 1y = 2"),
+            ("x = 1", "y = 2")
+        );
+        assert_eq!(
+            split_preamble("#eryx-preamble:0\nprint(1)"),
+            ("", "print(1)")
+        );
+        // Only one header is split off: a second one is user code.
+        assert_eq!(
+            split_preamble("#eryx-preamble:0\n#eryx-preamble:1\nx"),
+            ("", "#eryx-preamble:1\nx")
+        );
+        // Anything malformed is plain user code.
+        for code in [
+            "print(1)",
+            "#eryx-preamble:99\nshort",
+            "#eryx-preamble:x\ncode",
+            "#eryx-preamble:1",
+            "#eryx-preamble:1\n\u{e9}",
+        ] {
+            assert_eq!(split_preamble(code), ("", code));
+        }
+    }
 
     #[test]
     fn test_escape_json_string_basic() {

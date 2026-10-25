@@ -276,13 +276,6 @@ impl Sandbox {
     ) -> Result<ExecuteResult, Error> {
         let start = Instant::now();
 
-        // Prepend preamble to user code if present
-        let full_code = if self.preamble.is_empty() {
-            code.to_string()
-        } else {
-            format!("{}\n\n# User code\n{}", self.preamble, code)
-        };
-
         // Create channel for callback requests
         let (callback_tx, callback_rx) = mpsc::channel::<CallbackRequest>(32);
 
@@ -355,7 +348,8 @@ impl Sandbox {
         // always enables tracing, even if result collection was disabled.
         let mut execute_builder = self
             .executor
-            .execute(&full_code)
+            .execute(code)
+            .with_preamble(self.preamble.as_str())
             .with_callbacks(&callbacks, callback_tx);
         if let Some(token) = cancel_token {
             execute_builder = execute_builder.with_cancellation(token);
