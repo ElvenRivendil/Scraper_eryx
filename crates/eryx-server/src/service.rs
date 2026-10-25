@@ -212,6 +212,7 @@ impl crate::proto::eryx::v1::eryx_server::Eryx for EryxService {
                     internal_hosts: nc.internal_hosts,
                     resolver: None,
                     custom_root_certs: vec![],
+                    allow_plaintext_secrets: false,
                 })
             })
             .transpose()?;
@@ -375,6 +376,7 @@ impl crate::proto::eryx::v1::eryx_server::Eryx for EryxService {
         };
         sandbox = sandbox
             .with_callbacks(cbs)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?
             .with_resource_limits(resource_limits.clone());
         let pool_stats = self.pool.stats();
         span.in_scope(|| {

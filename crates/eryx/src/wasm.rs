@@ -95,6 +95,9 @@ impl<T> RetryableOnce<T> {
 /// A process-lifetime epoch ticker.
 struct EpochTicker {
     handle: std::thread::JoinHandle<()>,
+    /// The process that started the thread: a forked child inherits this
+    /// handle but not the thread, so its epochs would never advance.
+    pid: u32,
 }
 
 impl EpochTicker {
@@ -115,7 +118,10 @@ impl EpochTicker {
                 Error::EpochTicker(format!("Failed to start epoch ticker: {error}"))
             })?;
 
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            pid: std::process::id(),
+        })
     }
 }
 
@@ -128,6 +134,14 @@ fn observe_epoch_ticker(ticker: &mut Option<EpochTicker>) -> std::result::Result
     let Some(dead) = ticker.take() else {
         return Ok(false);
     };
+
+    // Started before a fork: the thread only exists in the parent. Forget the
+    // handle (joining or detaching a thread this process doesn't have is
+    // unsound) so a fresh ticker is started.
+    if dead.pid != std::process::id() {
+        std::mem::forget(dead);
+        return Ok(false);
+    }
 
     if !dead.handle.is_finished() {
         *ticker = Some(dead);
@@ -380,6 +394,11 @@ pub struct ExecutionOutput {
     /// Why result capture failed (e.g. the value was not JSON-serializable), or
     /// `None` when capture succeeded or no result variable was set.
     pub result_error: Option<String>,
+    /// Whether the session lost its Python state before this run: an earlier
+    /// call was cancelled or halted mid-run without a snapshot to roll back
+    /// to, so the instance was reset. Reported once, by the first successful
+    /// run after the reset; always `false` outside sessions.
+    pub state_was_reset: bool,
 }
 
 impl ExecutionOutput {
@@ -405,6 +424,7 @@ impl ExecutionOutput {
             fuel_consumed,
             result: None,
             result_error: None,
+            state_was_reset: false,
         }
     }
 
@@ -3212,6 +3232,7 @@ mod tests {
     fn test_epoch_ticker_dead_worker_is_reported_and_slot_is_retryable() {
         let mut ticker = Some(EpochTicker {
             handle: std::thread::spawn(|| {}),
+            pid: std::process::id(),
         });
         while !ticker.as_ref().unwrap().handle.is_finished() {
             std::thread::yield_now();
@@ -3226,12 +3247,29 @@ mod tests {
         // ticker thread.
         ticker = Some(EpochTicker {
             handle: std::thread::spawn(|| {}),
+            pid: std::process::id(),
         });
         while !ticker.as_ref().unwrap().handle.is_finished() {
             std::thread::yield_now();
         }
         assert!(observe_epoch_ticker(&mut ticker).is_err());
         assert!(ticker.is_none());
+    }
+
+    #[test]
+    fn test_epoch_ticker_from_another_process_is_replaced() {
+        // A live worker that "belongs" to another process, as after a fork.
+        let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let mut ticker = Some(EpochTicker {
+            handle: std::thread::spawn(move || {
+                let _ = stopped.recv();
+            }),
+            pid: std::process::id().wrapping_add(1),
+        });
+
+        assert!(!observe_epoch_ticker(&mut ticker).unwrap());
+        assert!(ticker.is_none(), "the inherited ticker must be dropped");
+        drop(stop);
     }
 
     #[test]
