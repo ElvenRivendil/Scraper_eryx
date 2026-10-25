@@ -795,12 +795,6 @@ class PoolError(EryxError):
     ...
 
 
-class PoolExhaustedError(PoolError):
-    """All sandboxes in the pool are in use."""
-
-    ...
-
-
 class PoolTimeoutError(PoolError):
     """Timed out waiting for an available sandbox."""
 
@@ -974,6 +968,7 @@ class SandboxFactory:
         resource_limits: Optional[ResourceLimits] = None,
         network: Optional[NetConfig] = None,
         callbacks: Optional[Union[CallbackRegistry, Sequence[CallbackDict]]] = None,
+        mcp: Optional[MCPManager] = None,
         volumes: Optional[Sequence[tuple[str, str, bool]]] = None,
         on_stdout: Optional[Callable[[bytes], None]] = None,
         on_stderr: Optional[Callable[[bytes], None]] = None,
@@ -991,7 +986,8 @@ class SandboxFactory:
         `Session.vfs`. Caller-provided `vfs` retains its own policy and quota.
 
         Supported options include VFS storage and mounts, resource limits,
-        networking, callbacks, volumes, output handlers, and a result variable.
+        networking, callbacks, MCP tools, volumes, output handlers, and a result
+        variable.
         Defaults are no execution, memory, or fuel limit, a 10-second callback
         timeout, and 1000 callback invocations.
 
@@ -1007,13 +1003,16 @@ class SandboxFactory:
         resource_limits: Optional[ResourceLimits] = None,
         network: Optional[NetConfig] = None,
         callbacks: Optional[Union[CallbackRegistry, Sequence[CallbackDict]]] = None,
+        mcp: Optional[MCPManager] = None,
         secrets: Optional[dict[str, SecretDict]] = None,
         scrub_stdout: Optional[bool] = None,
         scrub_stderr: Optional[bool] = None,
+        scrub_result: Optional[bool] = None,
         scrub_files: Optional[bool] = None,
         volumes: Optional[Sequence[tuple[str, str, bool]]] = None,
         on_stdout: Optional[Callable[[bytes], None]] = None,
         on_stderr: Optional[Callable[[bytes], None]] = None,
+        result_variable: Optional[str] = None,
     ) -> Sandbox:
         """Create a new sandbox from this factory.
 
@@ -1027,6 +1026,9 @@ class SandboxFactory:
             network: Optional network configuration. If provided, enables networking.
             callbacks: Optional callbacks that sandboxed code can invoke.
                 Can be a CallbackRegistry or a list of callback dicts.
+            mcp: Optional MCPManager with connected MCP servers. Tools from
+                connected servers are exposed as callbacks named
+                ``mcp.<server>.<tool>``.
             secrets: Optional dict of secret names to secret configurations.
                 Each value is a dict with "value" (required) and "allowed_hosts"
                 (optional, defaults to []).
@@ -1034,8 +1036,13 @@ class SandboxFactory:
                 Defaults to True when secrets are provided.
             scrub_stderr: Whether to scrub secret placeholders from stderr.
                 Defaults to True when secrets are provided.
+            scrub_result: Whether to scrub secret placeholders from the structured
+                ``result`` (and ``result_error``). Defaults to False even when
+                secrets are provided.
             scrub_files: Whether to scrub secret placeholders from file writes.
                 Defaults to True when secrets are provided.
+            result_variable: Name of the variable captured from the script and exposed
+                as ``ExecuteResult.result`` (JSON-serialized). Defaults to ``"result"``.
 
         Returns:
             A new Sandbox ready to execute Python code.
@@ -1062,6 +1069,11 @@ class SandboxFactory:
         min_idle: int = 1,
         acquire_timeout_ms: int = 30000,
         idle_timeout_ms: int = 300000,
+        network: Optional[NetConfig] = None,
+        secrets: Optional[dict[str, SecretDict]] = None,
+        scrub_stdout: Optional[bool] = None,
+        scrub_stderr: Optional[bool] = None,
+        scrub_files: Optional[bool] = None,
     ) -> SandboxPool:
         """Create a sandbox pool from this factory.
 
@@ -1075,6 +1087,18 @@ class SandboxFactory:
             min_idle: Minimum warm sandboxes to keep ready. Default: 1.
             acquire_timeout_ms: Max wait for a sandbox in ms. Default: 30000.
             idle_timeout_ms: Idle sandbox eviction threshold in ms. Default: 300000.
+            network: Optional network configuration for every pooled sandbox.
+            secrets: Optional secrets for every pooled sandbox, in the same
+                format as ``Sandbox(secrets=...)``.
+            scrub_stdout: Whether to scrub secret placeholders from stdout.
+                Defaults to True when secrets are provided.
+            scrub_stderr: Whether to scrub secret placeholders from stderr.
+                Defaults to True when secrets are provided.
+            scrub_files: Whether to scrub secret placeholders from file writes.
+                Defaults to True when secrets are provided.
+
+        Network and secrets are fixed for the pool's lifetime, unlike the
+        per-request settings passed to ``acquire()``.
 
         Returns:
             A ``SandboxPool`` ready to lease sandboxes.
@@ -1382,8 +1406,15 @@ class VfsStorage:
         print(result.stdout)  # "hello"
     """
 
-    def __new__(cls) -> VfsStorage:
-        """Create a new empty VFS storage."""
+    def __new__(cls, *, max_bytes: Optional[int] = None) -> VfsStorage:
+        """Create a new empty VFS storage.
+
+        Args:
+            max_bytes: Cap on the total size of all file contents combined.
+                Writes that would exceed it fail inside the sandbox with
+                ``OSError``. ``None`` (the default) means 64 MiB. The storage owns
+                this cap, so ``ResourceLimits.max_vfs_bytes`` does not apply.
+        """
         ...
 
 

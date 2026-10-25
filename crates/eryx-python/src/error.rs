@@ -2,7 +2,7 @@
 //!
 //! Maps Eryx errors to Python exceptions with appropriate types.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use pyo3::exceptions::{PyException, PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
@@ -58,12 +58,6 @@ create_exception!(
 create_exception!(eryx, PoolError, EryxError, "Base pool error.");
 create_exception!(
     eryx,
-    PoolExhaustedError,
-    PoolError,
-    "All sandboxes in the pool are in use."
-);
-create_exception!(
-    eryx,
     PoolTimeoutError,
     PoolError,
     "Timed out waiting for an available sandbox."
@@ -111,17 +105,35 @@ pub fn eryx_error_to_py(err: eryx::Error) -> PyErr {
 
 /// Get the process-wide Tokio runtime shared by every sandbox, session,
 /// factory and MCP manager, creating it on first use.
+///
+/// The runtime is per process: a child created with `os.fork()` has none of
+/// the parent runtime's worker threads, so the first call in the child builds
+/// a fresh runtime. Objects created before the fork still hold the parent's
+/// runtime and must not be used in the child; create new ones there.
 pub fn make_runtime() -> PyResult<Arc<tokio::runtime::Runtime>> {
-    static RUNTIME: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
-    if let Some(runtime) = RUNTIME.get() {
-        return Ok(Arc::clone(runtime));
+    static RUNTIME: Mutex<Option<(u32, Arc<tokio::runtime::Runtime>)>> = Mutex::new(None);
+    let pid = std::process::id();
+    let mut slot = RUNTIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match slot.take() {
+        Some((owner, runtime)) if owner == pid => {
+            *slot = Some((owner, Arc::clone(&runtime)));
+            return Ok(runtime);
+        }
+        // Inherited from the parent across a fork. Dropping it would wait for
+        // worker threads that don't exist in this process, so leak it.
+        Some((_, stale)) => std::mem::forget(stale),
+        None => {}
     }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| InitializationError::new_err(format!("failed to create runtime: {e}")))?;
-    // A racing thread may have won; its runtime is kept and ours is dropped.
-    Ok(Arc::clone(RUNTIME.get_or_init(|| Arc::new(runtime))))
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| InitializationError::new_err(format!("failed to create runtime: {e}")))?,
+    );
+    *slot = Some((pid, Arc::clone(&runtime)));
+    Ok(runtime)
 }
 
 /// Convert an `eryx::PoolError` to a Python exception.
@@ -165,10 +177,6 @@ pub fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CancelledError", m.py().get_type::<CancelledError>())?;
     m.add("SuspendCallback", m.py().get_type::<SuspendCallback>())?;
     m.add("PoolError", m.py().get_type::<PoolError>())?;
-    m.add(
-        "PoolExhaustedError",
-        m.py().get_type::<PoolExhaustedError>(),
-    )?;
     m.add("PoolTimeoutError", m.py().get_type::<PoolTimeoutError>())?;
     m.add("PoolClosedError", m.py().get_type::<PoolClosedError>())?;
     Ok(())
