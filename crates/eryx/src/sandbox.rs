@@ -4,7 +4,10 @@ use std::{
     collections::HashMap,
     marker::PhantomData,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -141,8 +144,6 @@ pub struct Sandbox {
     /// When set, this replaces the default scrubbing storage in `execute()`.
     #[cfg(feature = "vfs")]
     vfs_storage: Option<std::sync::Arc<dyn eryx_vfs::VfsStorage>>,
-    /// Extracted packages (kept alive to prevent temp directory cleanup).
-    _packages: Vec<crate::package::ExtractedPackage>,
 }
 
 impl std::fmt::Debug for Sandbox {
@@ -214,7 +215,7 @@ impl Sandbox {
     ///
     /// Returns an error if the Python code fails to execute or a resource limit is exceeded.
     pub async fn execute(&self, code: &str) -> Result<ExecuteResult, Error> {
-        self.run_inner(code, None).await
+        self.run_inner(code, None, None).await
     }
 
     /// Execute Python code with callback-result replay and journaling.
@@ -245,17 +246,19 @@ impl Sandbox {
         journal: Option<CallbackJournal>,
     ) -> ReplayOutcome {
         let state = ReplayState::shared(code, journal);
-        let result = self.run_inner(code, Some(Arc::clone(&state))).await;
+        let result = self.run_inner(code, Some(Arc::clone(&state)), None).await;
         ReplayOutcome::from_state(&state, code, result)
     }
 
-    /// Shared execution body for [`execute`](Self::execute) and
-    /// [`execute_with_journal`](Self::execute_with_journal).
+    /// Shared execution body for [`execute`](Self::execute),
+    /// [`execute_with_journal`](Self::execute_with_journal) and
+    /// [`execute_cancellable`](Self::execute_cancellable).
     ///
     /// When `replay_state` is `Some`, every registered callback is wrapped with
     /// a [`ReplayCallback`](crate::replay::ReplayCallback) sharing that state.
+    /// When `cancel_token` is `Some`, cancelling it interrupts the execution.
     #[tracing::instrument(
-        skip(self, code, replay_state),
+        skip(self, code, replay_state, cancel_token),
         fields(
             code_len = code.len(),
             callbacks = self.callbacks.len(),
@@ -269,6 +272,7 @@ impl Sandbox {
         &self,
         code: &str,
         replay_state: Option<Arc<Mutex<ReplayState>>>,
+        cancel_token: Option<CancellationToken>,
     ) -> Result<ExecuteResult, Error> {
         let start = Instant::now();
 
@@ -353,6 +357,9 @@ impl Sandbox {
             .executor
             .execute(&full_code)
             .with_callbacks(&callbacks, callback_tx);
+        if let Some(token) = cancel_token {
+            execute_builder = execute_builder.with_cancellation(token);
+        }
         if let Some(trace_tx) = trace_tx {
             execute_builder = execute_builder.with_tracing(trace_tx);
         }
@@ -435,21 +442,31 @@ impl Sandbox {
 
         // Wait for the handler tasks to complete
         // The callback channel is closed when execute_future completes (callback_tx dropped)
-        let callback_invocations = callback_handler.await.unwrap_or(0);
+        let callback_invocations = callback_handler.await;
         let trace_events = match trace_collector {
-            Some(trace_collector) => trace_collector.await.unwrap_or_default(),
-            None => Vec::new(),
+            Some(trace_collector) => trace_collector.await,
+            None => Ok(Vec::new()),
         };
 
         // Network handler completes when its channel is dropped (execute_builder dropped)
-        if let Some(handler) = net_handler {
-            let _ = handler.await;
-        }
+        let net_result = match net_handler {
+            Some(handler) => handler.await,
+            None => Ok(()),
+        };
 
         // Output handler completes when its channel is dropped (execute_builder dropped)
-        if let Some(handler) = output_handler_task {
-            let _ = handler.await;
-        }
+        let output_result = match output_handler_task {
+            Some(handler) => handler.await,
+            None => Ok(()),
+        };
+
+        // A handler task only fails by panicking (e.g. in a user callback or
+        // handler), which loses callback results, trace events or output.
+        let callback_invocations =
+            callback_invocations.map_err(|e| handler_task_failed("callback handler", &e))?;
+        let trace_events = trace_events.map_err(|e| handler_task_failed("trace collector", &e))?;
+        net_result.map_err(|e| handler_task_failed("network handler", &e))?;
+        output_result.map_err(|e| handler_task_failed("output handler", &e))?;
 
         let duration = start.elapsed();
 
@@ -616,7 +633,7 @@ impl Sandbox {
     pub fn set_callbacks(&mut self, callbacks: Vec<Box<dyn Callback>>) {
         let mut map = HashMap::new();
         for callback in callbacks {
-            map.insert(callback.name().to_string(), Arc::from(callback));
+            insert_callback(&mut map, Arc::from(callback));
         }
         self.callbacks = Arc::new(map);
     }
@@ -669,18 +686,20 @@ impl Sandbox {
     /// Execute Python code with cancellation support.
     ///
     /// Returns an [`ExecutionHandle`] that can be used to cancel the execution
-    /// or wait for its completion.
+    /// or wait for its completion. The execution runs on a spawned task, so
+    /// this must be called from within a Tokio runtime. Dropping the handle
+    /// before the execution finishes cancels it.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// let handle = sandbox.execute_cancellable("while True: pass").await?;
+    /// let handle = sandbox.execute_cancellable("while True: pass");
     ///
     /// // Cancel after 5 seconds from another task
-    /// let cancel_handle = handle.clone();
+    /// let cancel_token = handle.cancellation_token();
     /// tokio::spawn(async move {
     ///     tokio::time::sleep(Duration::from_secs(5)).await;
-    ///     cancel_handle.cancel();
+    ///     cancel_token.cancel();
     /// });
     ///
     /// // Wait for result
@@ -690,10 +709,6 @@ impl Sandbox {
     ///     Err(e) => println!("Error: {e}"),
     /// }
     /// ```
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the execution cannot be started.
     #[tracing::instrument(
         skip(self, code),
         fields(code_len = code.len())
@@ -702,317 +717,77 @@ impl Sandbox {
         let cancel_token = CancellationToken::new();
         let (result_tx, result_rx) = oneshot::channel();
 
-        // Clone what we need for the spawned task
-        let executor = Arc::clone(&self.executor);
-        let callbacks = Arc::clone(&self.callbacks);
-        let preamble = self.preamble.clone();
-        let trace_handler = self.trace_handler.clone();
-        let collect_trace = self.collect_trace;
-        let tracing_enabled = self.tracing_enabled();
-        let output_handler = self.output_handler.clone();
-        let resource_limits = self.resource_limits.clone();
-        let net_config = self.net_config.clone();
-        let secrets = self.secrets.clone();
-        let scrub_stdout = self.scrub_stdout.clone();
-        let scrub_stderr = self.scrub_stderr.clone();
-        let scrub_result = self.scrub_result;
-        let scrub_files = self.scrub_files.clone();
-        #[cfg(feature = "vfs")]
-        let volumes = self.volumes.clone();
-        #[cfg(feature = "vfs")]
-        let vfs_storage = self.vfs_storage.clone();
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let sandbox = self.clone_for_task();
         let code = code.to_string();
         let token = cancel_token.clone();
+        let task_finished = Arc::clone(&finished);
 
-        // Spawn the execution task
         tokio::spawn(async move {
-            let result = Self::execute_with_cancellation(
-                executor,
-                callbacks,
-                &preamble,
-                trace_handler,
-                collect_trace,
-                tracing_enabled,
-                output_handler,
-                resource_limits,
-                net_config,
-                secrets,
-                scrub_stdout,
-                scrub_stderr,
-                scrub_result,
-                scrub_files,
-                #[cfg(feature = "vfs")]
-                volumes,
-                #[cfg(feature = "vfs")]
-                vfs_storage,
-                &code,
-                token,
-            )
-            .await;
-
+            let result = sandbox.run_inner(&code, None, Some(token)).await;
+            task_finished.store(true, Ordering::Release);
             // Send result back (ignore error if receiver dropped)
             let _ = result_tx.send(result);
         });
 
         ExecutionHandle {
             cancel_token,
+            finished,
             result: result_rx,
         }
     }
 
-    /// Internal execution with cancellation support.
-    #[allow(clippy::too_many_arguments, unused_variables)]
-    async fn execute_with_cancellation(
-        executor: Arc<PythonExecutor>,
-        callbacks: Arc<HashMap<String, Arc<dyn Callback>>>,
-        preamble: &str,
-        trace_handler: Option<Arc<dyn TraceHandler>>,
-        collect_trace: bool,
-        tracing_enabled: bool,
-        output_handler: Option<Arc<dyn OutputHandler>>,
-        resource_limits: ResourceLimits,
-        net_config: Option<NetConfig>,
-        secrets: HashMap<String, crate::secrets::SecretConfig>,
-        scrub_stdout: crate::secrets::OutputScrubPolicy,
-        scrub_stderr: crate::secrets::OutputScrubPolicy,
-        scrub_result: bool,
-        scrub_files: crate::secrets::FileScrubPolicy,
-        #[cfg(feature = "vfs")] volumes: Vec<crate::session::VolumeMount>,
-        #[cfg(feature = "vfs")] vfs_storage_override: Option<
-            std::sync::Arc<dyn eryx_vfs::VfsStorage>,
-        >,
-        code: &str,
-        cancel_token: CancellationToken,
-    ) -> Result<ExecuteResult, Error> {
-        let start = Instant::now();
-
-        // Prepend preamble to user code if present
-        let full_code = if preamble.is_empty() {
-            code.to_string()
-        } else {
-            format!(
-                "{}
-
-# User code
-{}",
-                preamble, code
-            )
-        };
-
-        // Create channel for callback requests
-        let (callback_tx, callback_rx) = mpsc::channel::<CallbackRequest>(32);
-
-        // Collect callbacks as a Vec for the executor
-        let callbacks_vec: Vec<Arc<dyn Callback>> = callbacks.values().cloned().collect();
-
-        // Spawn task to handle callback requests concurrently
-        let callbacks_arc = Arc::clone(&callbacks);
-        let resource_limits_clone = resource_limits.clone();
-        let secrets_arc = Arc::new(secrets.clone());
-        let callback_secrets = Arc::clone(&secrets_arc);
-        let callback_handler = tokio::spawn(async move {
-            run_callback_handler(
-                callback_rx,
-                callbacks_arc,
-                resource_limits_clone,
-                callback_secrets,
-            )
-            .await
-        });
-
-        // Create the trace channel and collector only when tracing is enabled.
-        let (trace_tx, trace_collector) = if tracing_enabled {
-            let (trace_tx, trace_rx) = mpsc::unbounded_channel::<TraceRequest>();
-            let trace_handler = trace_handler.clone();
-            let trace_secrets = secrets.clone();
-            let trace_collector = tokio::spawn(async move {
-                run_trace_collector(trace_rx, trace_handler, collect_trace, trace_secrets).await
-            });
-            (Some(trace_tx), Some(trace_collector))
-        } else {
-            (None, None)
-        };
-
-        // Spawn output collector for real-time streaming if handler is configured
-        let (output_tx, output_handler_task) = if output_handler.is_some() {
-            let (tx, rx) = mpsc::unbounded_channel::<OutputRequest>();
-            let handler = output_handler.clone();
-            let output_secrets = secrets.clone();
-            let scrub_out = matches!(scrub_stdout, crate::secrets::OutputScrubPolicy::All);
-            let scrub_err = matches!(scrub_stderr, crate::secrets::OutputScrubPolicy::All);
-            let task = tokio::spawn(async move {
-                run_output_collector(rx, handler, output_secrets, scrub_out, scrub_err).await
-            });
-            (Some(tx), Some(task))
-        } else {
-            (None, None)
-        };
-
-        // Spawn network handler if networking is enabled
-        let (net_tx, net_handler) = if let Some(ref config) = net_config {
-            let (tx, rx) = mpsc::channel::<crate::wasm::NetRequest>(32);
-            let manager = ConnectionManager::new(config.clone(), secrets.clone());
-            let handler = tokio::spawn(async move { run_net_handler(rx, manager).await });
-            (Some(tx), Some(handler))
-        } else {
-            (None, None)
-        };
-
-        // Execute the Python code using the builder API with cancellation.
-        let mut execute_builder = executor
-            .execute(&full_code)
-            .with_callbacks(&callbacks_vec, callback_tx)
-            .with_cancellation(cancel_token.clone());
-        if let Some(trace_tx) = trace_tx {
-            execute_builder = execute_builder.with_tracing(trace_tx);
-        }
-
-        // Add output streaming channel if handler is configured
-        if let Some(tx) = output_tx {
-            execute_builder = execute_builder.with_output_streaming(tx);
-        }
-
-        // Add network channel if networking is enabled
-        if let Some(tx) = net_tx {
-            execute_builder = execute_builder.with_network(tx);
-        }
-
-        // Add VFS storage — use per-request override if set, otherwise create
-        // a scrubbing storage from the secrets configuration.
-        #[cfg(feature = "vfs")]
-        {
-            let vfs_storage = if let Some(storage) = vfs_storage_override {
-                eryx_vfs::ArcStorage::new(storage)
-            } else {
-                let vfs_secrets = secrets
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            k.clone(),
-                            eryx_vfs::VfsSecretConfig {
-                                placeholder: v.placeholder.clone(),
-                            },
-                        )
-                    })
-                    .collect();
-                let vfs_policy = match &scrub_files {
-                    crate::secrets::FileScrubPolicy::All => eryx_vfs::VfsFileScrubPolicy::All,
-                    crate::secrets::FileScrubPolicy::None => eryx_vfs::VfsFileScrubPolicy::None,
-                    crate::secrets::FileScrubPolicy::Except(paths) => {
-                        eryx_vfs::VfsFileScrubPolicy::Except(paths.clone())
-                    }
-                    crate::secrets::FileScrubPolicy::Only(paths) => {
-                        eryx_vfs::VfsFileScrubPolicy::Only(paths.clone())
-                    }
-                };
-                let scrubbing_storage = eryx_vfs::ScrubbingStorage::new(
-                    eryx_vfs::InMemoryStorage::with_max_bytes(
-                        resource_limits
-                            .max_vfs_bytes
-                            .unwrap_or(eryx_vfs::DEFAULT_MAX_BYTES),
-                    ),
-                    vfs_secrets,
-                    vfs_policy,
-                );
-                eryx_vfs::ArcStorage::new(std::sync::Arc::new(scrubbing_storage))
-            };
-            execute_builder = execute_builder.with_vfs_storage(vfs_storage);
-        }
-
-        // Add volume mounts if configured
-        #[cfg(feature = "vfs")]
-        if !volumes.is_empty() {
-            execute_builder = execute_builder.with_volumes(volumes);
-        }
-
-        // Add memory limit if configured
-        if let Some(limit) = resource_limits.max_memory_bytes {
-            execute_builder = execute_builder.with_memory_limit(limit);
-        }
-
-        // Add timeout if configured
-        if let Some(timeout) = resource_limits.execution_timeout {
-            execute_builder = execute_builder.with_timeout(timeout);
-        }
-
-        // Add fuel limit if configured
-        if let Some(fuel) = resource_limits.max_fuel {
-            execute_builder = execute_builder.with_fuel_limit(fuel);
-        }
-
-        let execution_result = execute_builder.run().await;
-
-        // Wait for the handler tasks to complete
-        let callback_invocations = callback_handler.await.unwrap_or(0);
-        let trace_events = match trace_collector {
-            Some(trace_collector) => trace_collector.await.unwrap_or_default(),
-            None => Vec::new(),
-        };
-
-        // Output handler completes when its channel is dropped
-        if let Some(task) = output_handler_task {
-            let _ = task.await;
-        }
-
-        // Network handler completes when its channel is dropped
-        if let Some(handler) = net_handler {
-            let _ = handler.await;
-        }
-
-        let duration = start.elapsed();
-
-        match execution_result {
-            Ok(output) => {
-                // Scrub secret placeholders from final output based on policy
-                let stdout = if matches!(scrub_stdout, crate::secrets::OutputScrubPolicy::All) {
-                    crate::secrets::scrub_placeholders_bytes(&output.stdout, &secrets)
-                } else {
-                    output.stdout
-                };
-
-                let stderr = if matches!(scrub_stderr, crate::secrets::OutputScrubPolicy::All) {
-                    crate::secrets::scrub_placeholders_bytes(&output.stderr, &secrets)
-                } else {
-                    output.stderr
-                };
-
-                // The structured result is scrubbed only when explicitly opted in
-                // (it's a programmatic side channel). Scrub the error message too.
-                let (result, result_error) = if scrub_result {
-                    (
-                        output
-                            .result
-                            .map(|r| crate::secrets::scrub_placeholders(&r, &secrets)),
-                        output
-                            .result_error
-                            .map(|e| crate::secrets::scrub_placeholders(&e, &secrets)),
-                    )
-                } else {
-                    (output.result, output.result_error)
-                };
-
-                Ok(ExecuteResult {
-                    stdout,
-                    stderr,
-                    trace: trace_events,
-                    result,
-                    result_error,
-                    stats: ExecuteStats {
-                        duration,
-                        callback_invocations,
-                        peak_memory_bytes: Some(output.peak_memory_bytes),
-                        fuel_consumed: output.fuel_consumed,
-                    },
-                })
-            }
-            Err(error) => {
-                // The executor captures cancellation at the epoch interrupt.
-                // Do not re-read the live token here: it may have been
-                // cancelled after a timeout trap and would misclassify it.
-                Err(error)
-            }
+    /// A copy of this sandbox sharing its executor and callbacks, so an
+    /// execution can run on a spawned task.
+    fn clone_for_task(&self) -> Self {
+        Self {
+            executor: Arc::clone(&self.executor),
+            callbacks: Arc::clone(&self.callbacks),
+            preamble: self.preamble.clone(),
+            type_stubs: self.type_stubs.clone(),
+            trace_handler: self.trace_handler.clone(),
+            collect_trace: self.collect_trace,
+            output_handler: self.output_handler.clone(),
+            resource_limits: self.resource_limits.clone(),
+            net_config: self.net_config.clone(),
+            secrets: self.secrets.clone(),
+            scrub_stdout: self.scrub_stdout.clone(),
+            scrub_stderr: self.scrub_stderr.clone(),
+            scrub_result: self.scrub_result,
+            scrub_files: self.scrub_files.clone(),
+            #[cfg(feature = "vfs")]
+            volumes: self.volumes.clone(),
+            #[cfg(feature = "vfs")]
+            vfs_storage: self.vfs_storage.clone(),
         }
     }
+}
+
+/// Register `callback` under its name, warning when that replaces another.
+fn insert_callback(
+    callbacks: &mut HashMap<String, Arc<dyn Callback>>,
+    callback: Arc<dyn Callback>,
+) {
+    let name = callback.name().to_string();
+    if callbacks.insert(name.clone(), callback).is_some() {
+        tracing::warn!(
+            callback = %name,
+            "duplicate callback name; the later registration replaces the earlier one"
+        );
+    }
+}
+
+/// Quote `value` as a Python string literal.
+fn python_str_literal(value: &str) -> String {
+    // Serializing a `str` cannot fail.
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+/// Log and convert the failure of a task spawned to serve an execution.
+fn handler_task_failed(task: &str, error: &tokio::task::JoinError) -> Error {
+    tracing::error!(task, %error, "execution handler task failed");
+    Error::Execution(format!("{task} task failed: {error}"))
 }
 
 /// Handle to a cancellable execution.
@@ -1020,11 +795,15 @@ impl Sandbox {
 /// Created by [`Sandbox::execute_cancellable`]. Use this handle to cancel
 /// the execution or wait for its completion.
 ///
-/// The handle can be cloned to share cancellation control across tasks.
+/// To cancel from another task, share the token returned by
+/// [`cancellation_token`](Self::cancellation_token). Dropping the handle
+/// before the execution finishes cancels it.
 #[derive(Debug)]
 pub struct ExecutionHandle {
     /// Token used to signal cancellation.
     cancel_token: CancellationToken,
+    /// Set by the execution task once it has produced a result.
+    finished: Arc<AtomicBool>,
     /// Receiver for the execution result.
     result: oneshot::Receiver<Result<ExecuteResult, Error>>,
 }
@@ -1047,7 +826,7 @@ impl ExecutionHandle {
     /// or if it has been cancelled.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        !self.cancel_token.is_cancelled()
+        !self.finished.load(Ordering::Acquire) && !self.cancel_token.is_cancelled()
     }
 
     /// Get a clone of the cancellation token.
@@ -1070,8 +849,8 @@ impl ExecutionHandle {
     /// - The Python code raised an exception
     /// - A resource limit was exceeded
     /// - The execution timed out
-    pub async fn wait(self) -> Result<ExecuteResult, Error> {
-        match self.result.await {
+    pub async fn wait(mut self) -> Result<ExecuteResult, Error> {
+        match (&mut self.result).await {
             Ok(result) => result,
             Err(_) => {
                 // Channel closed without sending - execution was likely cancelled
@@ -1082,6 +861,16 @@ impl ExecutionHandle {
                     Err(Error::Execution("execution task failed".to_string()))
                 }
             }
+        }
+    }
+}
+
+impl Drop for ExecutionHandle {
+    fn drop(&mut self) {
+        // Nobody can observe the result any more, so stop the guest rather
+        // than letting it run to its timeout in the background.
+        if !self.finished.load(Ordering::Acquire) {
+            self.cancel_token.cancel();
         }
     }
 }
@@ -1796,8 +1585,7 @@ impl<R, S> SandboxBuilder<R, S> {
     pub fn with_library(mut self, library: RuntimeLibrary) -> Self {
         // Add callbacks from the library
         for callback in library.callbacks {
-            self.callbacks
-                .insert(callback.name().to_string(), Arc::from(callback));
+            insert_callback(&mut self.callbacks, Arc::from(callback));
         }
 
         // Append preamble
@@ -1823,8 +1611,7 @@ impl<R, S> SandboxBuilder<R, S> {
     #[must_use]
     pub fn with_callbacks(mut self, callbacks: Vec<Box<dyn Callback>>) -> Self {
         for callback in callbacks {
-            self.callbacks
-                .insert(callback.name().to_string(), Arc::from(callback));
+            insert_callback(&mut self.callbacks, Arc::from(callback));
         }
         self
     }
@@ -1832,9 +1619,7 @@ impl<R, S> SandboxBuilder<R, S> {
     /// Add a single callback.
     #[must_use]
     pub fn with_callback(mut self, callback: impl Callback + 'static) -> Self {
-        let boxed: Box<dyn Callback> = Box::new(callback);
-        self.callbacks
-            .insert(boxed.name().to_string(), Arc::from(boxed));
+        insert_callback(&mut self.callbacks, Arc::new(callback));
         self
     }
 
@@ -1999,9 +1784,15 @@ impl<R, S> SandboxBuilder<R, S> {
             },
         );
 
-        // Set placeholder as environment variable via preamble
-        // TODO: Find proper way to set env vars in executor
-        let env_code = format!("import os\nos.environ[{:?}] = {:?}\n", name, placeholder);
+        // Set the placeholder as an environment variable via the preamble. The
+        // preinitialized runtime snapshots `os.environ`, so WASI env vars set
+        // per execution would not show up. JSON string literals are valid
+        // Python string literals, unlike Rust's `{:?}` escapes (`\u{1b}`).
+        let env_code = format!(
+            "import os\nos.environ[{}] = {}\n",
+            python_str_literal(&name),
+            python_str_literal(&placeholder)
+        );
         self.preamble.push_str(&env_code);
 
         self
@@ -2232,52 +2023,98 @@ impl<R, S> SandboxBuilder<R, S> {
 impl SandboxBuilder<state::Has, state::Has> {
     /// Convert this builder into a reusable factory closure.
     ///
-    /// The factory captures the wasm source and stdlib path so it can create
-    /// fresh sandboxes on demand. Per-request settings (callbacks, packages,
-    /// resource limits, etc.) are NOT captured -- each sandbox starts with
-    /// defaults for those.
+    /// The factory keeps the wasm source, stdlib and site-packages paths,
+    /// result variable and trace-collection setting, and builds fresh
+    /// sandboxes from them on demand. Anything else would be silently lost
+    /// (per-request settings are reset whenever a sandbox returns to the
+    /// pool, and the rest is not carried over), so builders that set it are
+    /// rejected; use [`SandboxPool::with_builder`](crate::SandboxPool::with_builder)
+    /// for those.
     ///
     /// This is used by [`SandboxPool`](crate::SandboxPool) to recreate sandboxes
     /// since `build()` consumes the builder.
-    pub(crate) fn into_factory(self) -> Box<dyn Fn() -> Result<Sandbox, Error> + Send + Sync> {
-        let wasm_source = self.wasm_source;
-        let stdlib_path = self.python_stdlib_path;
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the settings the factory would drop.
+    pub(crate) fn into_factory(
+        self,
+    ) -> Result<Box<dyn Fn() -> Result<Sandbox, Error> + Send + Sync>, Error> {
+        let dropped = self.settings_dropped_by_factory();
+        if !dropped.is_empty() {
+            return Err(Error::Initialization(format!(
+                "SandboxPool::new cannot keep these builder settings: {}. Set callbacks, \
+                 handlers and resource limits on each PooledSandbox, or use \
+                 SandboxPool::with_builder to build every sandbox yourself",
+                dropped.join(", ")
+            )));
+        }
 
-        Box::new(move || {
-            // Reconstruct a builder using the public API based on the captured config.
-            let builder = match &wasm_source {
-                #[cfg(feature = "embedded")]
-                WasmSource::EmbeddedRuntime => Sandbox::embedded(),
-                #[cfg(any(feature = "embedded", feature = "preinit"))]
-                WasmSource::PrecompiledFile(path) => {
-                    let stdlib = stdlib_path.as_ref().ok_or_else(|| {
-                        Error::Initialization("stdlib path required for precompiled file".into())
-                    })?;
-                    // SAFETY: The original builder was already constructed with unsafe
-                    // by the caller, who vouched for the .cwasm file's trustworthiness.
-                    #[allow(unsafe_code)]
-                    unsafe {
-                        Sandbox::builder()
-                            .with_precompiled_file(path)
-                            .with_python_stdlib(stdlib)
-                    }
-                }
-                WasmSource::File(path) => {
-                    let stdlib = stdlib_path
-                        .as_ref()
-                        .ok_or_else(|| Error::Initialization("stdlib path required".into()))?;
-                    Sandbox::builder()
-                        .with_wasm_file(path)
-                        .with_python_stdlib(stdlib)
-                }
-                _ => {
-                    return Err(Error::Initialization(
-                        "unsupported wasm source for pool factory".into(),
-                    ));
-                }
-            };
-            builder.build()
-        })
+        let wasm_source = match self.wasm_source {
+            // Share the bytes between sandboxes instead of copying them each time.
+            #[cfg(any(feature = "embedded", feature = "preinit"))]
+            WasmSource::PrecompiledBytes(bytes) => {
+                WasmSource::PrecompiledArtifact(PrecompiledArtifact::new(bytes))
+            }
+            source => source,
+        };
+        let python_stdlib_path = self.python_stdlib_path;
+        let python_site_packages_path = self.python_site_packages_path;
+        let result_variable = self.result_variable;
+        let collect_trace = self.collect_trace;
+
+        Ok(Box::new(move || {
+            let mut builder = SandboxBuilder::new();
+            builder.wasm_source = wasm_source.clone();
+            builder.python_stdlib_path = python_stdlib_path.clone();
+            builder.python_site_packages_path = python_site_packages_path.clone();
+            builder.result_variable = result_variable.clone();
+            builder.collect_trace = collect_trace;
+            builder.transition::<state::Has, state::Has>().build()
+        }))
+    }
+
+    /// Names of the settings [`into_factory`](Self::into_factory) cannot keep.
+    fn settings_dropped_by_factory(&self) -> Vec<&'static str> {
+        let mut dropped = Vec::new();
+        if !self.callbacks.is_empty() {
+            dropped.push("callbacks");
+        }
+        if !self.preamble.is_empty() || !self.type_stubs.is_empty() {
+            dropped.push("libraries/preamble");
+        }
+        if self.trace_handler.is_some() {
+            dropped.push("trace handler");
+        }
+        if self.output_handler.is_some() {
+            dropped.push("output handler");
+        }
+        if self.resource_limits != ResourceLimits::default() {
+            dropped.push("resource limits");
+        }
+        if !self.packages.is_empty() {
+            dropped.push("packages");
+        }
+        #[cfg(feature = "native-extensions")]
+        if !self.native_extensions.is_empty() {
+            dropped.push("native extensions");
+        }
+        #[cfg(feature = "native-extensions")]
+        if self.cache.is_some() || self.filesystem_cache.is_some() {
+            dropped.push("component cache");
+        }
+        if self.net_config.is_some() {
+            dropped.push("network");
+        }
+        // Secrets also add a preamble, and scrub policies only matter with secrets.
+        if !self.secrets.is_empty() {
+            dropped.push("secrets");
+        }
+        #[cfg(feature = "vfs")]
+        if !self.volumes.is_empty() {
+            dropped.push("volumes");
+        }
+        dropped
     }
 
     /// Build the sandbox.
@@ -2366,17 +2203,18 @@ impl SandboxBuilder<state::Has, state::Has> {
         #[cfg(not(feature = "native-extensions"))]
         let executor = self.build_executor_from_source()?;
 
-        // Determine stdlib path: explicit > embedded > auto-detect > none
+        // Determine stdlib path: explicit > embedded. A failure to extract the
+        // embedded stdlib is an error rather than a reason to go looking for a
+        // possibly mismatched one on disk.
         #[cfg(feature = "embedded")]
-        let stdlib_path = self
-            .python_stdlib_path
-            .clone()
-            .or_else(|| {
-                crate::embedded::EmbeddedResources::get()
-                    .ok()
-                    .map(|r| r.stdlib_path.clone())
-            })
-            .or_else(find_python_stdlib);
+        let stdlib_path = match self.python_stdlib_path.clone() {
+            Some(path) => Some(path),
+            None => Some(
+                crate::embedded::EmbeddedResources::get()?
+                    .stdlib_path
+                    .clone(),
+            ),
+        };
 
         #[cfg(not(feature = "embedded"))]
         let stdlib_path = self.python_stdlib_path.clone().or_else(find_python_stdlib);
@@ -2402,8 +2240,11 @@ impl SandboxBuilder<state::Has, state::Has> {
             .into_iter()
             .fold(executor, |exec, path| exec.with_site_packages(&path));
 
-        // Apply the configured result-capture variable name.
-        let executor = executor.with_result_variable(self.result_variable);
+        // Apply the configured result-capture variable name, and hand the
+        // executor the packages whose directories it mounts.
+        let executor = executor
+            .with_result_variable(self.result_variable)
+            .with_packages(self.packages);
 
         Ok(Sandbox {
             executor: Arc::new(executor),
@@ -2424,7 +2265,6 @@ impl SandboxBuilder<state::Has, state::Has> {
             volumes: self.volumes,
             #[cfg(feature = "vfs")]
             vfs_storage: None,
-            _packages: self.packages,
         })
     }
 
@@ -2520,7 +2360,11 @@ impl SandboxBuilder<state::Has, state::Has> {
             return PythonExecutor::from_cached_instance_pre(instance_pre);
         }
 
-        // Tier 2: Try filesystem cache (mmap-based, faster than bytes)
+        // Tier 2: Try filesystem cache (mmap-based, faster than bytes).
+        // An entry that fails to load (corrupt, or built by an incompatible
+        // engine) is relinked below, and the fresh `put` replaces it.
+        #[cfg(feature = "embedded")]
+        let mut cached_entry_failed = false;
         #[cfg(feature = "embedded")]
         if let Some(fs_cache) = &self.filesystem_cache
             && let Some(path) = fs_cache.get_path(&cache_key)
@@ -2536,12 +2380,26 @@ impl SandboxBuilder<state::Has, state::Has> {
             // wasmtime will detect it during deserialization.
             // Use with_key to populate InstancePreCache for future calls.
             #[allow(unsafe_code)]
-            return unsafe { PythonExecutor::from_precompiled_file_with_key(&path, cache_key) };
+            match unsafe {
+                PythonExecutor::from_precompiled_file_with_key(&path, cache_key.clone())
+            } {
+                Ok(executor) => return Ok(executor),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %path.display(),
+                        "cached component failed to load - relinking"
+                    );
+                    cached_entry_failed = true;
+                }
+            }
         }
 
         // Tier 2 (continued): Fall back to in-memory byte cache (for InMemoryCache users)
         #[cfg(feature = "embedded")]
-        if let Some(cache) = &self.cache {
+        if let Some(cache) = &self.cache
+            && !cached_entry_failed
+        {
             if let Some(precompiled) = cache.get(&cache_key) {
                 tracing::debug!(
                     key = %cache_key.to_hex(),
@@ -2549,14 +2407,23 @@ impl SandboxBuilder<state::Has, state::Has> {
                 );
                 // Load and populate InstancePreCache for future calls
                 #[allow(unsafe_code)]
-                let executor = unsafe { PythonExecutor::from_precompiled(&precompiled) }?;
-                InstancePreCache::global().put(cache_key, executor.instance_pre().clone());
-                return Ok(executor);
+                match unsafe { PythonExecutor::from_precompiled(&precompiled) } {
+                    Ok(executor) => {
+                        InstancePreCache::global().put(cache_key, executor.instance_pre().clone());
+                        return Ok(executor);
+                    }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        key = %cache_key.to_hex(),
+                        "cached component failed to load - relinking"
+                    ),
+                }
+            } else {
+                tracing::debug!(
+                    key = %cache_key.to_hex(),
+                    "component cache miss - will link and compile"
+                );
             }
-            tracing::debug!(
-                key = %cache_key.to_hex(),
-                "component cache miss - will link and compile"
-            );
         }
 
         // Cache miss or no cache - link the component
@@ -2728,7 +2595,7 @@ pub struct ExecuteStats {
 /// boundable, so it cannot be built with a struct literal from outside the
 /// crate. Its fields stay public, so reading them - and mutating them on a value
 /// you own - both still work.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ResourceLimits {
     /// Maximum execution time for the entire script.

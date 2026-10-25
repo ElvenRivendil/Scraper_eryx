@@ -53,8 +53,9 @@
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use crate::wasm::{ExecutorState, SandboxPre};
@@ -143,9 +144,15 @@ impl CacheKey {
     ///
     /// The extensions are sorted by name before hashing to ensure
     /// deterministic keys regardless of insertion order.
+    ///
+    /// The key also covers the base runtime libraries the extensions are
+    /// linked against and the engine's compilation settings (target, CPU
+    /// features, Cranelift flags), so a cache shared between builds or
+    /// machines never hands back a component built from something else.
     #[cfg(feature = "native-extensions")]
     pub fn from_extensions(extensions: &[eryx_runtime::linker::NativeExtension]) -> Self {
         let mut hasher = Sha256::new();
+        hasher.update(link_environment_hash());
 
         // Sort by name for determinism
         let mut sorted: Vec<_> = extensions.iter().collect();
@@ -180,6 +187,46 @@ impl CacheKey {
 
         hex_encode(&full_hash)
     }
+}
+
+/// Hash of everything besides the extensions that determines a linked,
+/// pre-compiled component: the base runtime libraries and the shared engine's
+/// compilation settings. Computed once per process.
+#[cfg(feature = "native-extensions")]
+fn link_environment_hash() -> [u8; 32] {
+    use eryx_runtime::linker::base_libraries as libs;
+    use std::hash::{Hash, Hasher};
+
+    static HASH: OnceLock<[u8; 32]> = OnceLock::new();
+    *HASH.get_or_init(|| {
+        let mut hasher = Sha256::new();
+        for lib in [
+            libs::LIBC,
+            libs::LIBCXX,
+            libs::LIBCXXABI,
+            libs::LIBPYTHON,
+            libs::LIBWASI_EMULATED_MMAN,
+            libs::LIBWASI_EMULATED_PROCESS_CLOCKS,
+            libs::LIBWASI_EMULATED_GETPID,
+            libs::LIBWASI_EMULATED_SIGNAL,
+            libs::WASI_ADAPTER,
+            libs::LIBERYX_RUNTIME,
+            libs::LIBERYX_BINDINGS,
+        ] {
+            hasher.update((lib.len() as u64).to_le_bytes());
+            hasher.update(lib);
+        }
+        hasher.update(crate::wasm::PythonExecutor::ENGINE_CONFIG_VERSION.to_le_bytes());
+        // If the engine can't be created, building the sandbox fails anyway.
+        if let Ok(engine) = crate::wasm::PythonExecutor::shared_engine() {
+            let mut engine_hasher = std::hash::DefaultHasher::new();
+            engine
+                .precompile_compatibility_hash()
+                .hash(&mut engine_hasher);
+            hasher.update(engine_hasher.finish().to_le_bytes());
+        }
+        hasher.finalize().into()
+    })
 }
 
 /// Get the wasmtime version string.
@@ -265,10 +312,24 @@ impl ComponentCache for FilesystemCache {
     fn put(&self, key: &CacheKey, precompiled: Vec<u8>) -> Result<(), CacheError> {
         let path = self.cache_path(key);
 
-        // Write to a temp file first, then rename for atomicity
-        let temp_path = path.with_extension("cwasm.tmp");
-        fs::write(&temp_path, &precompiled)?;
-        fs::rename(&temp_path, &path)?;
+        // Write to a temp file first, then rename for atomicity. The temp name
+        // is unique per writer so processes caching the same key concurrently
+        // never write into the same file, and the data is synced before the
+        // rename so a crash can't leave a truncated entry under the real name.
+        let temp_path = path.with_extension(format!(
+            "cwasm.{}-{:016x}.tmp",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let written = fs::File::create(&temp_path).and_then(|mut file| {
+            file.write_all(&precompiled)?;
+            file.sync_all()?;
+            fs::rename(&temp_path, &path)
+        });
+        if written.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        written?;
 
         Ok(())
     }
@@ -356,8 +417,11 @@ impl ComponentCache for NoCache {
 /// instances keyed by [`CacheKey`], eliminating the need to re-link imports
 /// on repeated sandbox creations with the same component.
 ///
-/// The cache is process-global and thread-safe. Entries persist for the
-/// lifetime of the process.
+/// The cache is process-global and thread-safe. It holds at most
+/// [`MAX_ENTRIES`](Self::MAX_ENTRIES) components (each can pin tens of
+/// megabytes of compiled code), evicting the least recently used one when
+/// full. Evicting an entry only means the next sandbox for that component
+/// loads it again; executors already created keep working.
 ///
 /// # Usage
 ///
@@ -379,10 +443,21 @@ impl ComponentCache for NoCache {
 /// }
 /// ```
 pub struct InstancePreCache {
-    cache: RwLock<HashMap<CacheKey, SandboxPre<ExecutorState>>>,
+    cache: RwLock<HashMap<CacheKey, InstancePreEntry>>,
+    /// Logical clock for least-recently-used eviction.
+    clock: AtomicU64,
+}
+
+/// A cached `SandboxPre` and when it was last used.
+struct InstancePreEntry {
+    pre: SandboxPre<ExecutorState>,
+    last_used: AtomicU64,
 }
 
 impl InstancePreCache {
+    /// Maximum number of cached components.
+    pub const MAX_ENTRIES: usize = 16;
+
     /// Get the global instance pre cache.
     ///
     /// This returns a reference to the process-global cache instance.
@@ -393,6 +468,7 @@ impl InstancePreCache {
             tracing::debug!("initializing global InstancePreCache");
             InstancePreCache {
                 cache: RwLock::new(HashMap::new()),
+                clock: AtomicU64::new(0),
             }
         })
     }
@@ -404,25 +480,45 @@ impl InstancePreCache {
     #[must_use]
     pub fn get(&self, key: &CacheKey) -> Option<SandboxPre<ExecutorState>> {
         let cache = self.cache.read().ok()?;
-        let result = cache.get(key).cloned();
-        if result.is_some() {
-            tracing::trace!(key = %key.to_hex(), "instance_pre cache hit");
-        }
-        result
+        let entry = cache.get(key)?;
+        entry.last_used.store(self.tick(), Ordering::Relaxed);
+        tracing::trace!(key = %key.to_hex(), "instance_pre cache hit");
+        Some(entry.pre.clone())
     }
 
     /// Store a `SandboxPre` in the cache.
     ///
     /// If an entry already exists for this key (race condition), the
-    /// existing entry is kept (first writer wins).
+    /// existing entry is kept (first writer wins). When the cache is full,
+    /// the least recently used entry is evicted to make room.
     pub fn put(&self, key: CacheKey, pre: SandboxPre<ExecutorState>) {
         if let Ok(mut cache) = self.cache.write() {
-            use std::collections::hash_map::Entry;
-            if let Entry::Vacant(e) = cache.entry(key.clone()) {
-                tracing::debug!(key = %key.to_hex(), "instance_pre cache store");
-                e.insert(pre);
+            if cache.contains_key(&key) {
+                return;
             }
+            if cache.len() >= Self::MAX_ENTRIES
+                && let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_used.load(Ordering::Relaxed))
+                    .map(|(key, _)| key.clone())
+            {
+                tracing::debug!(key = %oldest.to_hex(), "instance_pre cache evict");
+                cache.remove(&oldest);
+            }
+            tracing::debug!(key = %key.to_hex(), "instance_pre cache store");
+            cache.insert(
+                key,
+                InstancePreEntry {
+                    pre,
+                    last_used: AtomicU64::new(self.tick()),
+                },
+            );
         }
+    }
+
+    /// Advance the LRU clock.
+    fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Clear all cached entries.
@@ -615,6 +711,64 @@ mod tests {
 
         assert_ne!(embedded_key, other_key);
         assert_ne!(embedded_key.to_hex(), other_key.to_hex());
+    }
+
+    #[cfg(feature = "embedded")]
+    #[test]
+    fn instance_pre_cache_evicts_least_recently_used() {
+        let pre = crate::wasm::PythonExecutor::from_embedded_runtime()
+            .unwrap()
+            .instance_pre()
+            .clone();
+        let cache = InstancePreCache {
+            cache: RwLock::new(HashMap::new()),
+            clock: AtomicU64::new(0),
+        };
+        let key = |i: u8| CacheKey {
+            extensions_hash: [i; 32],
+            eryx_version: "0.1.0",
+            wasmtime_version: "39.0.0",
+        };
+
+        for i in 0..InstancePreCache::MAX_ENTRIES as u8 {
+            cache.put(key(i), pre.clone());
+        }
+        // Touch the oldest entry so the second-oldest becomes the LRU one.
+        assert!(cache.get(&key(0)).is_some());
+        cache.put(key(200), pre);
+
+        assert_eq!(cache.len(), InstancePreCache::MAX_ENTRIES);
+        assert!(cache.get(&key(0)).is_some());
+        assert!(cache.get(&key(1)).is_none());
+        assert!(cache.get(&key(200)).is_some());
+    }
+
+    #[test]
+    fn filesystem_cache_concurrent_puts_never_tear() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cache = FilesystemCache::new(temp_dir.path()).unwrap();
+        let key = CacheKey {
+            extensions_hash: [4u8; 32],
+            eryx_version: "0.1.0",
+            wasmtime_version: "39.0.0",
+        };
+
+        std::thread::scope(|scope| {
+            for writer in 0..8u8 {
+                let (cache, key) = (&cache, &key);
+                scope.spawn(move || {
+                    for _ in 0..20 {
+                        cache.put(key, vec![writer; 256 * 1024]).unwrap();
+                    }
+                });
+            }
+        });
+
+        let stored = cache.get(&key).unwrap();
+        assert_eq!(stored.len(), 256 * 1024);
+        assert!(stored.iter().all(|&b| b == stored[0]), "torn cache entry");
+        let leftovers = std::fs::read_dir(temp_dir.path()).unwrap().count();
+        assert_eq!(leftovers, 1, "temp files left behind");
     }
 
     #[test]
