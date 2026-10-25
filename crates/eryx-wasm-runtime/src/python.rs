@@ -1469,6 +1469,32 @@ def _eryx_trace_func(frame, event, arg):
 
     return _eryx_trace_func
 
+# Whether this instance's site-packages mounts have been put on sys.path.
+_eryx_site_packages_added = False
+
+def _eryx_add_site_packages():
+    '''Put the site-packages directories mounted on this instance on sys.path.
+
+    The host mounts them at /site-packages, /site-packages-1, ... and lists them
+    in PYTHONPATH, but an instance restored from the pre-init snapshot keeps the
+    snapshot's sys.path (and environment), so PYTHONPATH never takes effect.
+    Mounts are fixed for an instance's lifetime, so this runs once per instance.
+    '''
+    global _eryx_site_packages_added
+    _eryx_site_packages_added = True
+    import os
+    mounts = []
+    while True:
+        path = '/site-packages-%d' % len(mounts) if mounts else '/site-packages'
+        if not os.path.isdir(path):
+            break
+        mounts.append(path)
+    # Where the host's PYTHONPATH puts them: right after /python-stdlib, so a
+    # package can't shadow the standard library.
+    new = [p for p in mounts if p not in _sys.path]
+    at = _sys.path.index('/python-stdlib') + 1 if '/python-stdlib' in _sys.path else 0
+    _sys.path[at:at] = new
+
 def _eryx_exec(code, trace_enabled):
     '''Execute user code efficiently. Called once per execute().
 
@@ -1478,6 +1504,9 @@ def _eryx_exec(code, trace_enabled):
     '''
     global _eryx_callback_code
     _eryx_callback_code = 0
+
+    if not _eryx_site_packages_added:
+        _eryx_add_site_packages()
 
     # Clear async results from any previous execution (critical for preinit)
     _eryx_async_import_results.clear()
@@ -2634,6 +2663,9 @@ pub fn finalize_preinit() {
     static FINALIZED: AtomicBool = AtomicBool::new(false);
     if !FINALIZED.swap(true, Ordering::SeqCst) {
         reset_wasi_state();
+        // Pre-init executions ran with the pre-init mounts; each instance
+        // restored from the snapshot must look for its own.
+        let _ = unsafe { run_in_main(c"_eryx_site_packages_added = False") };
     }
 }
 
@@ -3279,8 +3311,12 @@ pub fn restore_state(data: &[u8]) -> Result<(), String> {
         // Set the bytes in Python
         set_python_variable_bytes("_eryx_restore_bytes", data)?;
 
-        // Deserialize with dill and update _eryx_user_globals
+        // Deserialize with dill and update _eryx_user_globals. The snapshot may
+        // reference packages, so they must be importable even before the
+        // instance's first execution.
         let restore_code = c"
+if not _eryx_site_packages_added:
+    _eryx_add_site_packages()
 import dill as _eryx_dill
 import types as _eryx_types
 
