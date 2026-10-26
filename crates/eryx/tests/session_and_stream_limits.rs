@@ -90,11 +90,15 @@ async fn state_op_timeout_can_be_set_separately() {
     let mut session = SessionExecutor::new(executor(), &[])
         .await
         .expect("session construction");
-    assert_eq!(session.state_op_timeout(), None);
+    // Without an execution timeout, state ops still get a bound.
+    assert_eq!(
+        session.state_op_timeout(),
+        eryx::session::DEFAULT_STATE_OP_TIMEOUT
+    );
     session.set_execution_timeout(Some(Duration::from_millis(100)));
     assert_eq!(
         session.state_op_timeout(),
-        Some(eryx::session::MIN_STATE_OP_TIMEOUT)
+        eryx::session::MIN_STATE_OP_TIMEOUT
     );
     session.set_execution_timeout(None);
     session.set_state_op_timeout(Some(Duration::from_millis(300)));
@@ -108,6 +112,40 @@ async fn state_op_timeout_can_be_set_separately() {
         .await
         .expect_err("snapshot should time out");
     assert!(matches!(err, Error::Timeout(_)), "got {err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn state_ops_can_be_cancelled() {
+    let mut session = SessionExecutor::new(executor(), &[])
+        .await
+        .expect("session construction");
+    session
+        .execute(SPIN_ON_SNAPSHOT)
+        .run()
+        .await
+        .expect("setup");
+
+    let token = eryx::CancellationToken::new();
+    session.set_state_op_cancellation(Some(token.clone()));
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        token.cancel();
+    });
+    let started = std::time::Instant::now();
+    let err = bounded(session.snapshot_state())
+        .await
+        .expect_err("snapshot should be cancelled");
+    assert!(matches!(err, Error::Cancelled), "got {err:?}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+
+    // A cancelled token stops later state ops up front; without one the
+    // session resets and carries on.
+    assert!(matches!(session.clear_state().await, Err(Error::Cancelled)));
+    session.set_state_op_cancellation(None);
+    let output = bounded(session.execute("print('spin' in globals())").run())
+        .await
+        .expect("session recovers");
+    assert_eq!(output.stdout_text().trim(), "False");
 }
 
 #[tokio::test]
@@ -161,6 +199,34 @@ async fn session_captures_direct_fd_writes_per_execution() {
         .await
         .expect("execute");
     assert_eq!(output.stdout_text().trim(), "next");
+}
+
+const FD_WRITE_THEN_RAISE: &str = "import os\nos.write(2, b'fd-err\\n')\nraise ValueError('boom')";
+
+fn assert_traceback_has_fd_write(err: Error) {
+    let Error::PythonException(traceback) = err else {
+        panic!("expected a Python exception, got {err:?}");
+    };
+    assert!(traceback.contains("ValueError"), "{traceback:?}");
+    assert!(traceback.contains("fd-err"), "{traceback:?}");
+}
+
+#[tokio::test]
+async fn direct_fd_writes_are_kept_when_the_script_raises() {
+    let sandbox = eryx::Sandbox::embedded().build().expect("sandbox");
+    let err = sandbox
+        .execute(FD_WRITE_THEN_RAISE)
+        .await
+        .expect_err("raises");
+    assert_traceback_has_fd_write(err);
+
+    let mut session = session_with_timeout(Duration::from_secs(10)).await;
+    let err = session
+        .execute(FD_WRITE_THEN_RAISE)
+        .run()
+        .await
+        .expect_err("raises");
+    assert_traceback_has_fd_write(err);
 }
 
 #[tokio::test]

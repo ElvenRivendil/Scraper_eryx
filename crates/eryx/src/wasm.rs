@@ -42,6 +42,7 @@ use wasmtime_wasi::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::callback::Callback;
 use crate::error::Error;
+use crate::fork_local::ForkLocal;
 use crate::trace::TraceEvent;
 use crate::warm::{WarmInstance, WarmPool};
 
@@ -168,9 +169,12 @@ pub(crate) fn is_already_cancelled(token: Option<&CancellationToken>) -> bool {
 
 /// Start or restart the process-lifetime epoch ticker for the shared engine.
 pub(crate) fn ensure_epoch_ticker(engine: &Engine) -> std::result::Result<(), Error> {
-    static EPOCH_TICKER: Mutex<Option<EpochTicker>> = Mutex::new(None);
+    // Per process, so a forked child never waits on a lock it inherited.
+    static EPOCH_TICKER: ForkLocal<Mutex<Option<EpochTicker>>> =
+        ForkLocal::new(|| Mutex::new(None));
 
     let mut ticker = EPOCH_TICKER
+        .get()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if observe_epoch_ticker(&mut ticker)? {
@@ -1020,12 +1024,14 @@ impl FdOutput {
 }
 
 /// Most bytes one execution may queue for each of the trace and output
-/// streams. The imports that feed them can't wait for a slow consumer, so
+/// streams, each queued event or chunk also being charged a small fixed
+/// overhead. The imports that feed them can't wait for a slow consumer, so
 /// anything past this is dropped from the stream (captured stdout/stderr in
 /// the final result are unaffected) and the execution reports
-/// [`ExecutionOutput::stream_truncated`].
+/// [`ExecutionOutput::stream_truncated`]. A consumer that builds its output
+/// from the stream, like `eryx-server`, can't keep more than this.
 // ponytail: fixed per-execution cap; make it configurable if a consumer needs more.
-pub(crate) const STREAM_BYTES_LIMIT: usize = 16 * 1024 * 1024;
+pub const STREAM_BYTES_LIMIT: usize = 16 * 1024 * 1024;
 
 /// What each queued trace event or output chunk is charged on top of its
 /// payload, for its allocation and channel slot. With [`STREAM_BYTES_LIMIT`]
@@ -1039,6 +1045,8 @@ pub(crate) struct StreamBudget {
     output: usize,
     /// Whether anything was dropped for lack of budget.
     pub(crate) truncated: bool,
+    /// Whether output chunks (not trace events) were dropped.
+    pub(crate) output_truncated: bool,
 }
 
 impl Default for StreamBudget {
@@ -1047,6 +1055,7 @@ impl Default for StreamBudget {
             trace: STREAM_BYTES_LIMIT,
             output: STREAM_BYTES_LIMIT,
             truncated: false,
+            output_truncated: false,
         }
     }
 }
@@ -1059,7 +1068,9 @@ impl StreamBudget {
 
     /// Charge one output chunk with `payload` bytes; `false` means drop it.
     fn spend_output(&mut self, payload: usize) -> bool {
-        Self::spend(&mut self.output, &mut self.truncated, payload, "output")
+        let spent = Self::spend(&mut self.output, &mut self.truncated, payload, "output");
+        self.output_truncated |= !spent;
+        spent
     }
 
     fn spend(left: &mut usize, truncated: &mut bool, payload: usize, stream: &str) -> bool {
@@ -3183,9 +3194,16 @@ impl PythonExecutor {
             )
             .await;
         let (fd_stdout, fd_stderr) = fd_output.take(store.data().output_tx.as_ref());
-        if let Ok(output) = &mut result {
-            output.stdout.extend(fd_stdout);
-            output.stderr.extend(fd_stderr);
+        match &mut result {
+            Ok(output) => {
+                output.stdout.extend(fd_stdout);
+                output.stderr.extend(fd_stderr);
+            }
+            // The traceback is the error's stderr.
+            Err(Error::PythonException(traceback)) => {
+                append_fd_stderr(traceback, &fd_stderr);
+            }
+            Err(_) => {}
         }
 
         // Teardown (resetting the memory slot) and re-instantiation happen off
@@ -3385,6 +3403,12 @@ impl PythonExecutor {
         output.stream_truncated = store.data().stream_budget.truncated;
         Ok(output)
     }
+}
+
+/// Append the guest's direct fd 2 writes to an uncaught exception's
+/// traceback, the way a successful run appends them to stderr.
+pub(crate) fn append_fd_stderr(traceback: &mut String, fd_stderr: &[u8]) {
+    traceback.push_str(&String::from_utf8_lossy(fd_stderr));
 }
 
 /// Parse a trace request into a `TraceEvent`.
