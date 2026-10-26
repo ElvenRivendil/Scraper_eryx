@@ -13,42 +13,165 @@
  *   ```
  */
 
-// Import the jco-generated bindings
+import { createCallbackHost } from "./shims/callbacks.js";
+import { createNet } from "./shims/net.js";
 import {
-  execute as _execute,
-  snapshotState as _snapshotState,
-  restoreState as _restoreState,
-  clearState as _clearState,
-  finalizePreinit as _finalizePreinit,
-  setResultVariable as _setResultVariable,
-} from "./eryx-sandbox.js";
+  _fileTree,
+  decodeError,
+  encodeError,
+  forkTree,
+  getCoreModule,
+  instantiateSandbox,
+  isNode,
+} from "./instance.js";
 
-// Import filesystem shim to populate with Python stdlib
-import { _setFileData } from "#preview2/filesystem";
+export { _fileTree } from "./instance.js";
 
-// Import stdlib loader
-import { loadStdlib } from "./stdlib-loader.js";
+/** Rejects a call that ran past its Sandbox's `timeoutMs`. */
+export class TimeoutError extends Error {
+  /** @param {number} timeoutMs */
+  constructor(timeoutMs) {
+    super(`execution timed out after ${timeoutMs} ms`);
+    this.name = "TimeoutError";
+  }
+}
 
-// Load the Python stdlib into the preview2-shim virtual filesystem.
-// This must happen before _finalizePreinit() so Python can find stdlib modules.
-const stdlibTree = await loadStdlib();
+/**
+ * Start a sandbox instance in its own Worker and return a proxy with the
+ * instance's methods, plus `terminate()`. The handlers, journal and network
+ * stay on this thread; the Worker forwards to them (see worker.js).
+ * @param {ReturnType<typeof createCallbackHost>} host
+ * @param {ReturnType<typeof createNet>} net - The sandbox's connection table
+ */
+async function instantiateInWorker(host, net) {
+  const url = new URL("./worker.js", import.meta.url);
+  const worker = isNode
+    ? // Not the parent's execArgv, which can hold `-e`/`--input-type` a Worker
+      // rejects. V8 flags such as --experimental-wasm-jspi are process-wide,
+      // so the Worker keeps them.
+      new (await import(/* webpackIgnore: true */ "node:worker_threads")).Worker(url, {
+        execArgv: [],
+      })
+    : new Worker(url, { type: "module" });
+  const targets = {
+    module: getCoreModule,
+    invoke: host.imports.invoke,
+    reportTrace: host.imports.reportTrace,
+    reportOutput: host.imports.reportOutput,
+    "tcp.connect": net.tcp.connect,
+    "tcp.read": net.tcp.read,
+    "tcp.write": net.tcp.write,
+    "tcp.close": net.tcp.close,
+    "tls.upgrade": net.tls.upgrade,
+    "tls.read": net.tls.read,
+    "tls.write": net.tls.write,
+    "tls.close": net.tls.close,
+  };
 
-// The stdlib tar extracts to python-stdlib/*, but the WASM expects
-// files at the root of the preopen (mounted as /python-stdlib).
-// So we set the root fileData to contain the stdlib directory contents.
-const stdlibDir = stdlibTree.dir?.["python-stdlib"] || stdlibTree;
+  let nextId = 0;
+  const pending = new Map();
+  // An idle Worker mustn't keep Node running, but a busy one must.
+  const busy = (yes) => isNode && (yes ? worker.ref() : worker.unref());
+  let failure = null;
+  let ready;
+  const started = new Promise((resolve, reject) => (ready = { resolve, reject }));
+  // Once the Worker is gone, nothing will close what its code left open.
+  const fail = (error) => {
+    if (failure) return;
+    failure = error;
+    net.closeConnections();
+    ready.reject(failure);
+    for (const { reject } of pending.values()) reject(failure);
+    pending.clear();
+  };
 
-// Build the file tree with stdlib and an empty site-packages directory.
-// This tree is exported so consumers (e.g., the demo) can add packages to it.
-export const _fileTree = {
-  dir: { "python-stdlib": stdlibDir, "site-packages": { dir: {} } },
-};
-_setFileData(_fileTree);
+  const onMessage = async (message) => {
+    switch (message.type) {
+      case "ready":
+        busy(false);
+        ready.resolve();
+        break;
+      case "failed":
+        fail(decodeError(message));
+        break;
+      case "result": {
+        const call = pending.get(message.id);
+        pending.delete(message.id);
+        if (pending.size === 0) busy(false);
+        if ("value" in message) call?.resolve(message.value);
+        else call?.reject(decodeError(message));
+        break;
+      }
+      case "notify":
+        if (!failure) targets[message.target](...message.args);
+        break;
+      case "request":
+        // A dead Worker's queued requests mustn't reach handlers or the network.
+        if (failure) break;
+        try {
+          const value = await targets[message.target](...message.args);
+          if (failure) {
+            // Opened after the Worker was stopped: nothing would ever close it.
+            if (message.target === "tcp.connect") net.tcp.close(value);
+            else if (message.target === "tls.upgrade") net.tls.close(value);
+            break;
+          }
+          worker.postMessage({ type: "reply", id: message.id, value });
+        } catch (e) {
+          if (!failure) worker.postMessage({ type: "reply", id: message.id, ...encodeError(e) });
+        }
+        break;
+    }
+  };
+  const onError = (e) => fail(e instanceof Error ? e : new Error(e.message ?? "sandbox worker failed"));
+  if (isNode) {
+    worker.on("message", onMessage);
+    worker.on("error", onError);
+    worker.on("exit", () => fail(new Error("sandbox worker exited")));
+  } else {
+    worker.addEventListener("message", (e) => onMessage(e.data));
+    worker.addEventListener("error", onError);
+  }
 
-// Complete Python interpreter initialization.
-// The pre-initialized WASM has Python's core state baked in, but
-// finalizePreinit() must still be called to finish setup.
-_finalizePreinit();
+  const call = (method, ...args) => {
+    if (failure) return Promise.reject(failure);
+    const id = nextId++;
+    busy(true);
+    worker.postMessage({
+      type: "call",
+      id,
+      method,
+      args,
+      callbacks: host.imports.listCallbacks(),
+      options: host.imports.getExecutionOptions(),
+    });
+    return new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
+  };
+
+  await started;
+  return {
+    execute: (code) => call("execute", code),
+    snapshotState: () => call("snapshotState"),
+    restoreState: (data) => call("restoreState", data),
+    clearState: () => call("clearState"),
+    setResultVariable: (name) => call("setResultVariable", name),
+    /** Stop the Worker, rejecting anything still pending with `error`. */
+    terminate(error) {
+      fail(error);
+      worker.terminate();
+    },
+  };
+}
+
+/**
+ * Terminates the Worker of a `timeoutMs` sandbox that was garbage collected
+ * without close(). Holds only the sandbox's Worker slot, never the sandbox.
+ * @type {FinalizationRegistry<{worker: any, closed: Error | null}>}
+ */
+const _workerReaper = new FinalizationRegistry((slot) => {
+  slot.closed ??= new Error("sandbox was garbage collected");
+  slot.worker?.terminate(slot.closed);
+});
 
 // Re-export callback configuration
 export {
@@ -61,9 +184,6 @@ export {
 
 // Re-export network policy configuration
 export { setNetConfig, DEFAULT_BLOCKED_HOSTS, DEFAULT_BLOCKED_NETWORKS } from "./shims/net.js";
-import { closeConnections } from "./shims/net.js";
-
-import { _beginReplay, _endReplay, _flushOutput } from "./shims/callbacks.js";
 
 /**
  * Result from executing Python code in the sandbox.
@@ -126,23 +246,6 @@ function _toResult(output) {
 }
 
 /**
- * Set the name of the variable captured as the structured result.
- *
- * After each execute(), the variable with this name is read from the script's
- * namespace, JSON-serialized, and returned as `ExecuteResult.result`. Applies to
- * the shared sandbox instance. Defaults to "result".
- *
- * The underlying export is async; await the returned promise before calling
- * execute() if you need the new name to take effect for the next execution.
- *
- * @param {string} name - The variable name to capture
- * @returns {Promise<void>}
- */
-export function setResultVariable(name) {
-  return _setResultVariable(name);
-}
-
-/**
  * The outcome of executeWithJournal().
  * @typedef {Object} ReplayOutcome
  * @property {ExecuteResult} [result] - The execution result, or undefined if it failed
@@ -157,77 +260,39 @@ export function setResultVariable(name) {
  *   Set if a callback threw SuspendCallback
  */
 
-// The tail of the queue of calls into the shared instance. Each call starts
-// only after the previous one settles, so executions never overlap: the
-// callback journal and the streaming output decoders are module-global, and
-// jco can't run two calls on one instance at once.
-let _queue = Promise.resolve();
-
 /**
- * Run `fn` once every call queued before it has settled.
- * @template T
- * @param {() => Promise<T>} fn
- * @returns {Promise<T>}
+ * Options for a {@link Sandbox}. Each handler option overrides, for this
+ * sandbox only, the module-wide default set by the setter of the same name
+ * (`setCallbackHandler()` and so on); an omitted option follows that default.
+ * @typedef {Object} SandboxOptions
+ * @property {((name: string, argsJson: string) => string | Promise<string>) | null} [callbackHandler]
+ * @property {Array<{name: string, description: string, parametersSchemaJson?: string}>} [callbacks]
+ * @property {((lineno: number, eventJson: string, contextJson: string) => void) | null} [traceHandler]
+ * @property {((stream: number, data: string) => void) | null} [outputHandler]
+ * @property {number} [timeoutMs] - Run the sandbox in its own Worker and
+ *   reject any call that takes longer than this many milliseconds with a
+ *   {@link TimeoutError}. The Worker is then terminated and replaced, so the
+ *   sandbox's Python state is lost. The deadline is wall-clock time, including
+ *   callbacks; instantiation doesn't count. The Worker costs about 70 MB.
+ *   Without it, nothing interrupts a call.
  */
-function _serialized(fn) {
-  const run = _queue.then(fn);
-  _queue = run.catch(() => {});
-  return run;
-}
-
-/**
- * Run code on the shared instance, flushing streamed output when it finishes.
- * Callers must hold the queue, so the flush can't cut into another execution's
- * output.
- * @param {string} code
- * @returns {Promise<ExecuteResult>}
- */
-async function _run(code) {
-  try {
-    // Frame the code with an empty preamble (see the guest's PREAMBLE_HEADER),
-    // so a leading header-like line in user code isn't misparsed.
-    return _toResult(await _execute(`#eryx-preamble:0\n${code}`));
-  } finally {
-    _flushOutput();
-    closeConnections();
-  }
-}
-
-/**
- * Execute code without journaling.
- * @param {string} code
- * @returns {Promise<ExecuteResult>}
- */
-function _executePlain(code) {
-  return _serialized(() => _run(code));
-}
-
-/**
- * Execute code while journaling callback results, replaying from `journal`.
- * @param {string} code
- * @param {{journal?: string}} [options]
- * @returns {Promise<ReplayOutcome>}
- */
-function _executeWithJournal(code, options) {
-  return _serialized(async () => {
-    _beginReplay(options?.journal);
-    let result;
-    let error;
-    try {
-      result = await _run(code);
-    } catch (e) {
-      error = e;
-    }
-    return { result, error, ..._endReplay(code) };
-  });
-}
 
 /**
  * A Python sandbox powered by WebAssembly.
  *
- * The sandbox executes Python code in complete isolation. Each Sandbox
- * instance maintains its own Python state (variables, imports, etc.)
- * across multiple execute() calls.
+ * Each Sandbox is its own WebAssembly instance, with its own Python
+ * interpreter, filesystem, network connections, callback handlers and
+ * journal, so code run in one can't see or change another's state. Python
+ * state (variables, imports, etc.) persists across execute() calls on the same
+ * Sandbox; connections are closed when each call finishes.
+ *
+ * The compiled code is shared, but every instance has its own linear memory
+ * (the pre-initialized interpreter image plus whatever the code allocates), so
+ * each live Sandbox costs tens of megabytes (about 20 MB idle on Node.js 24).
+ * One created with `timeoutMs` also runs in its own Worker, which adds about
+ * 70 MB. Call close() (or use `using`) when you're done with a sandbox: it
+ * stops the Worker at once and closes the sandbox's connections. A sandbox
+ * that is only dropped is freed whenever the garbage collector gets to it.
  *
  * @example
  * const sandbox = new Sandbox();
@@ -241,6 +306,137 @@ function _executeWithJournal(code, options) {
  * await sandbox.clearState();
  */
 export class Sandbox {
+  /** @type {ReturnType<typeof createCallbackHost>} */
+  #host;
+  /** @type {ReturnType<typeof createNet>} */
+  #net = createNet();
+  /** @type {number | undefined} */
+  #timeoutMs;
+  /** @type {Promise<any>} */
+  #instance;
+  /** The Worker of a `timeoutMs` sandbox, and why the sandbox was closed. */
+  #slot = { worker: null, closed: /** @type {Error | null} */ (null) };
+  /** The last name passed to setResultVariable(), re-applied after a restart. */
+  #resultVariable;
+  // The tail of the queue of calls into this instance. Each call starts only
+  // after the previous one settles, so executions never overlap: the journal
+  // and the streaming output decoders belong to the instance, and jco can't
+  // run two calls on one instance at once.
+  #queue = Promise.resolve();
+
+  /**
+   * Create a sandbox. Instantiation starts right away and finishes in the
+   * background; the first call waits for it, and rejects if it failed.
+   *
+   * @param {SandboxOptions} [options]
+   */
+  constructor(options = {}) {
+    const { timeoutMs } = options;
+    if (timeoutMs !== undefined && !(Number.isFinite(timeoutMs) && timeoutMs > 0)) {
+      throw new TypeError("timeoutMs must be a positive number of milliseconds");
+    }
+    this.#timeoutMs = timeoutMs;
+    /**
+     * This sandbox's own file tree (a copy of the module's `_fileTree`).
+     * Changes to it are visible to the sandbox's next filesystem access.
+     * Undefined for a sandbox with `timeoutMs`, whose files live in its Worker.
+     * @internal For the demo app and advanced integrations.
+     */
+    this._fileTree = timeoutMs === undefined ? forkTree(_fileTree) : undefined;
+    this.#host = createCallbackHost(options);
+    if (timeoutMs !== undefined) _workerReaper.register(this, this.#slot, this.#slot);
+    this.#start();
+  }
+
+  #start() {
+    if (this.#timeoutMs === undefined) {
+      this.#instance = instantiateSandbox(this._fileTree, this.#host.imports, this.#net);
+    } else {
+      const slot = this.#slot;
+      const name = this.#resultVariable;
+      this.#instance = instantiateInWorker(this.#host, this.#net).then(async (worker) => {
+        slot.worker = worker;
+        if (slot.closed) worker.terminate(slot.closed);
+        // A restarted Worker starts with the default result variable.
+        else if (name !== undefined) await worker.setResultVariable(name);
+        return worker;
+      });
+    }
+    // Surfaced by the first call instead.
+    this.#instance.catch(() => {});
+  }
+
+  /**
+   * Stop using this sandbox. Its open connections are closed, and every later
+   * call rejects. For a `timeoutMs` sandbox the Worker is terminated at once,
+   * so a call in flight rejects too; without `timeoutMs` a call in flight
+   * runs to the end. Calling it again does nothing.
+   */
+  close() {
+    if (this.#slot.closed) return;
+    this.#slot.closed = new Error("sandbox is closed");
+    _workerReaper.unregister(this.#slot);
+    this.#slot.worker?.terminate(this.#slot.closed);
+    this.#net.closeConnections();
+  }
+
+  /**
+   * Run `fn` on the instance once every call queued before it has settled.
+   * @template T
+   * @param {(instance: any) => Promise<T>} fn
+   * @returns {Promise<T>}
+   */
+  #serialized(fn) {
+    const run = this.#queue.then(() => {
+      if (this.#slot.closed) throw this.#slot.closed;
+      return this.#call(fn);
+    });
+    this.#queue = run.catch(() => {});
+    return run;
+  }
+
+  /**
+   * Run `fn` on the instance, under the deadline if there is one. On timeout,
+   * the Worker is terminated and a fresh one started for later calls.
+   * @template T
+   * @param {(instance: any) => Promise<T>} fn
+   * @returns {Promise<T>}
+   */
+  async #call(fn) {
+    const instance = await this.#instance;
+    if (this.#timeoutMs === undefined) return fn(instance);
+    // Terminating the Worker rejects the call in flight with the TimeoutError,
+    // which executeWithJournal() then reports like any other failure.
+    const timer = setTimeout(() => {
+      instance.terminate(new TimeoutError(this.#timeoutMs));
+      this.#start();
+    }, this.#timeoutMs);
+    try {
+      return await fn(instance);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Run code, flushing streamed output when it finishes. Callers must hold the
+   * queue, so the flush can't cut into another execution's output.
+   * @param {any} instance
+   * @param {string} code
+   * @returns {Promise<ExecuteResult>}
+   */
+  async #run(instance, code) {
+    try {
+      // Frame the code with an empty preamble (see the guest's PREAMBLE_HEADER),
+      // so a leading header-like line in user code isn't misparsed.
+      return _toResult(await instance.execute(`#eryx-preamble:0\n${code}`));
+    } finally {
+      this.#host.flushOutput();
+      // Connections don't outlive the execution that opened them.
+      this.#net.closeConnections();
+    }
+  }
+
   /**
    * Execute Python code in the sandbox.
    *
@@ -248,10 +444,10 @@ export class Sandbox {
    * and stderr is captured and returned. Variables and imports persist
    * across calls on the same Sandbox instance.
    *
-   * Calls on the shared instance run one at a time, in call order; an
-   * execute() made while another call is running waits for it to finish.
-   * Don't await execute() from inside a callback handler: it would wait for
-   * the execution that invoked the handler, which never finishes.
+   * Calls on one Sandbox run one at a time, in call order; an execute() made
+   * while another call on it is running waits for it to finish. Don't await
+   * execute() on the same Sandbox from inside its callback handler: it would
+   * wait for the execution that invoked the handler, which never finishes.
    *
    * @param {string} code - Python source code to execute
    * @returns {Promise<ExecuteResult>} Captured stdout and stderr
@@ -262,7 +458,7 @@ export class Sandbox {
    * console.log(result.stdout);  // "hello\n"
    */
   async execute(code) {
-    return _executePlain(code);
+    return this.#serialized((instance) => this.#run(instance, code));
   }
 
   /**
@@ -276,15 +472,40 @@ export class Sandbox {
    * set and a journal to resume from.
    *
    * Never throws for script failures: check `suspended`, then `error`. Like
-   * every call on the shared instance, it waits for earlier calls to finish
-   * first.
+   * every call on this Sandbox, it waits for earlier calls to finish first.
    *
    * @param {string} code - Python source code to execute
    * @param {{journal?: string}} [options] - A journal from a previous run to replay
    * @returns {Promise<ReplayOutcome>}
    */
   async executeWithJournal(code, options) {
-    return _executeWithJournal(code, options);
+    return this.#serialized(async (instance) => {
+      this.#host.beginReplay(options?.journal);
+      let result;
+      let error;
+      try {
+        result = await this.#run(instance, code);
+      } catch (e) {
+        error = e;
+      }
+      return { result, error, ...this.#host.endReplay(code) };
+    });
+  }
+
+  /**
+   * Set the name of the variable captured as the structured result.
+   *
+   * After each execute(), the variable with this name is read from the
+   * script's namespace, JSON-serialized, and returned as
+   * `ExecuteResult.result`. Defaults to "result". Takes effect for calls made
+   * after it.
+   *
+   * @param {string} name - The variable name to capture
+   * @returns {Promise<void>}
+   */
+  async setResultVariable(name) {
+    await this.#serialized((instance) => instance.setResultVariable(name));
+    this.#resultVariable = name;
   }
 
   /**
@@ -297,7 +518,7 @@ export class Sandbox {
    * @throws {Error} If serialization fails (e.g., unpicklable objects)
    */
   async snapshotState() {
-    return _serialized(() => _snapshotState());
+    return this.#serialized((instance) => instance.snapshotState());
   }
 
   /**
@@ -310,7 +531,7 @@ export class Sandbox {
    * @throws {Error} If deserialization fails
    */
   async restoreState(data) {
-    await _serialized(() => _restoreState(data));
+    await this.#serialized((instance) => instance.restoreState(data));
   }
 
   /**
@@ -320,19 +541,39 @@ export class Sandbox {
    * namespace (no user-defined variables from previous calls).
    */
   async clearState() {
-    await _serialized(() => _clearState());
+    await this.#serialized((instance) => instance.clearState());
   }
 }
 
+// `using sandbox = new Sandbox()` closes it at the end of the scope, where the
+// runtime has explicit resource management.
+for (const symbol of [Symbol.dispose, Symbol.asyncDispose]) {
+  if (symbol) {
+    Object.defineProperty(Sandbox.prototype, symbol, {
+      value() {
+        this.close();
+      },
+      configurable: true,
+      writable: true,
+    });
+  }
+}
+
+/** @type {Sandbox | undefined} */
+let _defaultSandbox;
+
+/** The sandbox behind the module-level helpers, created on first use. */
+function _default() {
+  return (_defaultSandbox ??= new Sandbox());
+}
+
 /**
- * Execute Python code in a fresh sandbox.
+ * Execute Python code in the default sandbox.
  *
- * This is a convenience function that uses the shared global sandbox state.
- * For isolated execution, create a Sandbox instance instead.
- *
- * Note: Unlike the Sandbox class, state from previous execute() calls
- * persists because this uses the same underlying WASM instance. Call
- * clearState() on a Sandbox instance to reset.
+ * This is a convenience function backed by one module-wide Sandbox, created
+ * on first use, so state from previous execute() calls persists. It shares
+ * nothing with Sandbox instances you create yourself; use one of those for
+ * isolated execution.
  *
  * @param {string} code - Python source code to execute
  * @returns {Promise<ExecuteResult>} Captured stdout and stderr
@@ -343,17 +584,28 @@ export class Sandbox {
  * console.log(result.stdout);  // "hello"
  */
 export async function execute(code) {
-  return _executePlain(code);
+  return _default().execute(code);
 }
 
 /**
- * Execute Python code using the shared global sandbox state, journaling
- * callback results. See {@link Sandbox#executeWithJournal}.
+ * Execute Python code in the default sandbox, journaling callback results.
+ * See {@link Sandbox#executeWithJournal}.
  *
  * @param {string} code - Python source code to execute
  * @param {{journal?: string}} [options] - A journal from a previous run to replay
  * @returns {Promise<ReplayOutcome>}
  */
 export async function executeWithJournal(code, options) {
-  return _executeWithJournal(code, options);
+  return _default().executeWithJournal(code, options);
+}
+
+/**
+ * Set the name of the variable captured as the structured result in the
+ * default sandbox. See {@link Sandbox#setResultVariable}.
+ *
+ * @param {string} name - The variable name to capture
+ * @returns {Promise<void>}
+ */
+export function setResultVariable(name) {
+  return _default().setResultVariable(name);
 }

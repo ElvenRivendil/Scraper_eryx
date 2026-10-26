@@ -12,12 +12,21 @@ npm install @bsull/eryx
 
 ## Sandbox Class
 
-The `Sandbox` class provides an isolated Python environment. Each instance maintains its own state across `execute()` calls.
+The `Sandbox` class provides an isolated Python environment. Each instance is its own WebAssembly instance, with its own interpreter, filesystem, network connections, callback handlers and journal, and keeps its state across `execute()` calls. The compiled code is shared, but each instance has its own memory (about 20 MB idle on Node.js 24). Call `sandbox.close()` (or declare it with `using`) when you're done: it closes the sandbox's connections, terminates its Worker if it has one, and makes later calls reject. A sandbox that is only dropped is freed whenever the garbage collector gets to it.
 
 ```javascript
 import { Sandbox } from "@bsull/eryx";
 
 const sandbox = new Sandbox();
+```
+
+`new Sandbox(options)` can give the sandbox its own `callbackHandler`, `callbacks`, `traceHandler` and `outputHandler`. Any it omits follow the module-wide defaults set by the [handler functions](#handler-functions).
+
+`timeoutMs` runs the sandbox in its own Worker (`worker_threads` in Node.js) and terminates it when a call takes longer. The call rejects with a `TimeoutError` (`executeWithJournal()` reports it as `outcome.error`), and the sandbox starts over with fresh Python state. Without it, nothing interrupts a call that never finishes. The Worker costs about 70 MB on top of the sandbox's memory.
+
+```javascript
+const sandbox = new Sandbox({ timeoutMs: 5_000 });
+await sandbox.execute("while True: pass"); // rejects with TimeoutError
 ```
 
 ### `execute(code: string): Promise<ExecuteResult>`
@@ -48,8 +57,8 @@ console.log(result.result); // { answer: 42, items: [ 1, 2, 3 ] }
 ```
 
 If the value is not JSON-serializable, `result.result` is `undefined` and
-`result.resultError` explains why. Use `setResultVariable("name")` to capture a
-different variable name.
+`result.resultError` explains why. Use `sandbox.setResultVariable("name")` to
+capture a different variable name.
 
 ### `executeWithJournal(code: string, options?): Promise<ReplayOutcome>`
 
@@ -104,7 +113,7 @@ await sandbox.clearState();
 
 ### `execute(code: string): Promise<ExecuteResult>`
 
-Execute Python code using a shared global sandbox state. For isolated execution, create a `Sandbox` instance instead.
+Execute Python code in a default sandbox, created on first use, whose state persists across calls. It shares nothing with `Sandbox` instances you create. `executeWithJournal()` and `setResultVariable()` also have module-level versions that use the same default sandbox.
 
 ```javascript
 import { execute } from "@bsull/eryx";
@@ -117,7 +126,7 @@ console.log(result.stdout);  // "Hello!\n"
 
 ### `setCallbackHandler(handler)`
 
-Register a callback handler that sandboxed Python code can invoke.
+Register the default callback handler that sandboxed Python code can invoke. It applies to every sandbox not given its own `callbackHandler` option.
 
 ```javascript
 import { setCallbackHandler, setCallbacks, Sandbox } from "@bsull/eryx";
@@ -136,7 +145,7 @@ setCallbackHandler((name, argsJson) => {
 
 ### `setOutputHandler(handler)`
 
-Set a handler for streaming stdout/stderr output in real-time.
+Set the default handler for streaming stdout/stderr output in real-time.
 
 ```javascript
 import { setOutputHandler } from "@bsull/eryx";
@@ -155,7 +164,7 @@ setOutputHandler((stream, data) => {
 
 ### `setTraceHandler(handler)`
 
-Set a handler for execution trace events.
+Set the default handler for execution trace events.
 
 ```javascript
 import { setTraceHandler } from "@bsull/eryx";

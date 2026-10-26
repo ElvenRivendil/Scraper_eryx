@@ -34,7 +34,7 @@ console.log(result.result); // { answer: 42, items: [ 1, 2, 3 ] }
 
 If the value is not JSON-serializable, `result.result` is `undefined` and
 `result.resultError` explains why (execution still succeeds). Use
-`setResultVariable("name")` to capture a different variable name.
+`sandbox.setResultVariable("name")` to capture a different variable name.
 
 ### Persistent state
 
@@ -86,6 +86,18 @@ result = json.loads(invoke("get_weather", json.dumps({"city": "NYC"})))
 print(f"Temperature in {result['city']}: {result['temp']}°{result['unit']}")
 `);
 ```
+
+`setCallbacks()` and `setCallbackHandler()` set the defaults for every sandbox. To
+give one sandbox its own, pass them as options:
+
+```js
+const sandbox = new Sandbox({
+  callbacks: [{ name: "get_weather", description: "Get current weather for a city" }],
+  callbackHandler: (name, argsJson) => JSON.stringify({ temp: 72 }),
+});
+```
+
+`traceHandler` and `outputHandler` work the same way.
 
 ### Networking
 
@@ -151,9 +163,26 @@ for i in range(5):
 `);
 ```
 
+### Timeouts
+
+Nothing interrupts a call by default, so `while True: pass` never returns. Pass `timeoutMs` to run the sandbox in its own Worker (`worker_threads` in Node.js) that is terminated when a call runs too long:
+
+```js
+import { Sandbox, TimeoutError } from "@bsull/eryx";
+
+const sandbox = new Sandbox({ timeoutMs: 5_000 });
+try {
+  await sandbox.execute("while True: pass");
+} catch (e) {
+  console.log(e instanceof TimeoutError); // true
+}
+```
+
+The call rejects with a `TimeoutError` (or `executeWithJournal()` reports it as `outcome.error`) and the sandbox starts over with fresh Python state. Callbacks, output and networking still run on the creating thread. The Worker costs about 70 MB on top of the sandbox's own memory, and the sandbox's `_fileTree` isn't available. `close()` terminates the Worker at once; otherwise it lives until the sandbox is garbage collected.
+
 ### Node.js and the WASI shims
 
-Under Node.js, eryx loads the in-memory (browser) build of `@bytecodealliance/preview2-shim`, because the Node.js build backs WASI with the real filesystem. Importing `@bytecodealliance/preview2-shim/*` yourself resolves to the Node.js build, a separate instance from the one eryx uses, so state set through it (such as `_setFileData()`) never reaches the sandbox.
+Under Node.js, eryx loads the in-memory (browser) build of `@bytecodealliance/preview2-shim`, because the Node.js build backs WASI with the real filesystem. Each sandbox gets its own in-memory filesystem, so state set through the shim's module-wide functions (such as `_setFileData()`) never reaches a sandbox.
 
 ### Vite / webpack
 
@@ -177,22 +206,27 @@ export default defineConfig({
 
 | Method | Returns | Description |
 |--------|---------|-------------|
+| `new Sandbox(options?)` | `Sandbox` | Create an isolated sandbox; `options` can set its own `callbackHandler`, `callbacks`, `traceHandler`, `outputHandler` and `timeoutMs` |
 | `execute(code)` | `Promise<{ stdout, stderr }>` | Run Python code |
 | `executeWithJournal(code, { journal? })` | `Promise<ReplayOutcome>` | Run with callback journaling/replay |
+| `setResultVariable(name)` | `Promise<void>` | Change the captured result variable |
+| `close()` | `void` | Close connections, stop a `timeoutMs` Worker, reject later calls (also `using`) |
 | `snapshotState()` | `Promise<Uint8Array>` | Serialize interpreter state |
 | `restoreState(data)` | `Promise<void>` | Restore from snapshot |
 | `clearState()` | `Promise<void>` | Reset all user state |
 
-Every `Sandbox` shares one interpreter instance, and calls on it run one at a time, in call order: a call made while another is running waits for it to finish. So don't await `execute()` from inside a callback handler, since it would wait on the execution that called the handler.
+Each `Sandbox` is its own WebAssembly instance, with its own interpreter, filesystem, network connections, callbacks and journal; code in one can't see another's state. The compiled code is shared, but each instance has its own memory (about 20 MB idle on Node.js 24). Call `sandbox.close()` (or declare it with `using`) when you're done; a sandbox that is only dropped is freed whenever the garbage collector gets to it. The module-level `execute()`, `executeWithJournal()` and `setResultVariable()` use one default sandbox, created on first use.
+
+Calls on one sandbox run one at a time, in call order: a call made while another is running waits for it to finish. So don't await `execute()` on the same sandbox from inside its callback handler, since it would wait on the execution that called the handler. Different sandboxes run independently.
 
 ### Callbacks
 
 | Function | Description |
 |----------|-------------|
-| `setCallbackHandler(fn)` | Register a `(name, argsJson) => resultJson` handler |
-| `setCallbacks(infos)` | Register callbacks visible to Python's `list_callbacks()` |
-| `setTraceHandler(fn)` | Receive line-level execution trace events |
-| `setOutputHandler(fn)` | Receive streaming stdout/stderr |
+| `setCallbackHandler(fn)` | Register the default `(name, argsJson) => resultJson` handler |
+| `setCallbacks(infos)` | Register the default callbacks visible to Python's `list_callbacks()` |
+| `setTraceHandler(fn)` | Receive line-level execution trace events (default) |
+| `setOutputHandler(fn)` | Receive streaming stdout/stderr (default) |
 | `SuspendCallback` | Throw from a handler to suspend execution |
 
 ## How it works

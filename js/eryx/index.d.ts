@@ -15,6 +15,8 @@ export {
 export { setNetConfig, DEFAULT_BLOCKED_HOSTS, DEFAULT_BLOCKED_NETWORKS } from "./shims/net.js";
 export type { NetConfig } from "./shims/net.js";
 
+import type { CallbackInfo } from "./shims/callbacks.js";
+
 /**
  * Result from executing Python code in the sandbox.
  */
@@ -89,11 +91,60 @@ export interface ReplayOutcome {
 }
 
 /**
+ * Options for a {@link Sandbox}.
+ *
+ * Each handler option overrides, for this sandbox only, the module-wide default
+ * set by the setter of the same name (`setCallbackHandler()` and so on). An
+ * omitted option follows that default, including later changes to it.
+ */
+export interface SandboxOptions {
+  /** Handler for callbacks invoked by sandbox code. */
+  callbackHandler?:
+    | ((name: string, argsJson: string) => string | Promise<string>)
+    | null;
+  /** Callbacks visible to sandbox code via `list_callbacks()`. */
+  callbacks?: CallbackInfo[];
+  /** Handler for trace events from the Python runtime. */
+  traceHandler?:
+    | ((lineno: number, eventJson: string, contextJson: string) => void)
+    | null;
+  /** Handler for streaming output: stream 0 = stdout, 1 = stderr. */
+  outputHandler?: ((stream: number, data: string) => void) | null;
+  /**
+   * Run the sandbox in its own Worker (a `worker_threads` Worker in Node.js)
+   * and reject any call that takes longer than this many milliseconds with a
+   * {@link TimeoutError}. The Worker is then terminated and replaced, so the
+   * sandbox's Python state is lost. The deadline is wall-clock time and
+   * includes time spent in callbacks; instantiation doesn't count.
+   *
+   * Each such sandbox also holds a Worker with its own JavaScript heap and its
+   * own copy of the Python stdlib tree, about 70 MB on top of the instance's
+   * memory. Without `timeoutMs`, nothing interrupts a call that never finishes.
+   */
+  timeoutMs?: number;
+}
+
+/** Rejects a call that ran past its Sandbox's `timeoutMs`. */
+export class TimeoutError extends Error {
+  constructor(timeoutMs: number);
+}
+
+/**
  * A Python sandbox powered by WebAssembly.
  *
- * The sandbox executes Python code in complete isolation. Each Sandbox
- * instance maintains its own Python state (variables, imports, etc.)
- * across multiple execute() calls.
+ * Each Sandbox is its own WebAssembly instance, with its own Python
+ * interpreter, filesystem, network connections, callback handlers and
+ * journal, so code run in one can't see or change another's state. Python
+ * state (variables, imports, etc.) persists across execute() calls on the same
+ * Sandbox; connections are closed when each call finishes.
+ *
+ * The compiled code is shared, but every instance has its own linear memory
+ * (the pre-initialized interpreter image plus whatever the code allocates), so
+ * each live Sandbox costs tens of megabytes (about 20 MB idle on Node.js 24).
+ * One created with `timeoutMs` also runs in its own Worker, which adds about
+ * 70 MB. Call close() (or use `using`) when you're done with a sandbox: it
+ * stops the Worker at once and closes the sandbox's connections. A sandbox
+ * that is only dropped is freed whenever the garbage collector gets to it.
  *
  * @example
  * const sandbox = new Sandbox();
@@ -108,16 +159,31 @@ export interface ReplayOutcome {
  */
 export class Sandbox {
   /**
+   * Create a sandbox. Instantiation starts right away and finishes in the
+   * background; the first call waits for it, and rejects if it failed.
+   */
+  constructor(options?: SandboxOptions);
+
+  /**
+   * This sandbox's own file tree (a copy of the module's `_fileTree`). Changes
+   * to it are visible to the sandbox's next filesystem access. Undefined for a
+   * sandbox with `timeoutMs`, whose files live in its Worker.
+   *
+   * @internal For the demo app and advanced integrations.
+   */
+  readonly _fileTree: { dir: Record<string, unknown> } | undefined;
+
+  /**
    * Execute Python code in the sandbox.
    *
    * The code runs in the sandboxed Python interpreter. Output to stdout
    * and stderr is captured and returned. Variables and imports persist
    * across calls on the same Sandbox instance.
    *
-   * Calls on the shared instance run one at a time, in call order; an
-   * execute() made while another call is running waits for it to finish.
-   * Don't await execute() from inside a callback handler: it would wait for
-   * the execution that invoked the handler, which never finishes.
+   * Calls on one Sandbox run one at a time, in call order; an execute() made
+   * while another call on it is running waits for it to finish. Don't await
+   * execute() on the same Sandbox from inside its callback handler: it would
+   * wait for the execution that invoked the handler, which never finishes.
    *
    * @param code - Python source code to execute
    * @returns Captured stdout and stderr
@@ -135,13 +201,35 @@ export class Sandbox {
    * throw {@link SuspendCallback} to halt execution.
    *
    * Never rejects for script failures: check `suspended`, then `error`. Like
-   * every call on the shared instance, it waits for earlier calls to finish
-   * first.
+   * every call on this Sandbox, it waits for earlier calls to finish first.
    */
   executeWithJournal(
     code: string,
     options?: ExecuteWithJournalOptions,
   ): Promise<ReplayOutcome>;
+
+  /**
+   * Set the name of the variable captured as the structured result.
+   *
+   * After each `execute()`, the variable with this name is read from the
+   * script's namespace, JSON-serialized, and returned as
+   * `ExecuteResult.result`. Defaults to `"result"`. Takes effect for calls made
+   * after it.
+   *
+   * @param name - The variable name to capture
+   */
+  setResultVariable(name: string): Promise<void>;
+
+  /**
+   * Stop using this sandbox. Its open connections are closed, and every later
+   * call rejects. For a `timeoutMs` sandbox the Worker is terminated at once,
+   * so a call in flight rejects too; without `timeoutMs` a call in flight runs
+   * to the end. Calling it again does nothing. `using` and `await using` call
+   * it at the end of their scope.
+   */
+  close(): void;
+  [Symbol.dispose](): void;
+  [Symbol.asyncDispose](): void;
 
   /**
    * Capture a snapshot of the current Python session state.
@@ -169,10 +257,12 @@ export class Sandbox {
 }
 
 /**
- * Execute Python code using the shared global sandbox state.
+ * Execute Python code in the default sandbox.
  *
- * This is a convenience function. For isolated execution, create a
- * Sandbox instance instead.
+ * This is a convenience function backed by one module-wide Sandbox, created on
+ * first use, so state from previous calls persists. It shares nothing with
+ * Sandbox instances you create yourself; use one of those for isolated
+ * execution.
  *
  * @param code - Python source code to execute
  * @returns Captured stdout and stderr
@@ -181,8 +271,8 @@ export class Sandbox {
 export function execute(code: string): Promise<ExecuteResult>;
 
 /**
- * Execute Python code using the shared global sandbox state, journaling
- * callback results. See {@link Sandbox.executeWithJournal}.
+ * Execute Python code in the default sandbox, journaling callback results.
+ * See {@link Sandbox.executeWithJournal}.
  */
 export function executeWithJournal(
   code: string,
@@ -190,26 +280,18 @@ export function executeWithJournal(
 ): Promise<ReplayOutcome>;
 
 /**
- * Set the name of the variable captured as the structured result.
- *
- * After each `execute()`, the variable with this name is read from the script's
- * namespace, JSON-serialized, and returned as `ExecuteResult.result`. Applies to
- * the shared sandbox instance. Defaults to `"result"`.
- *
- * The underlying export is async; await the returned promise before calling
- * `execute()` if you need the new name to take effect for the next execution.
+ * Set the name of the variable captured as the structured result in the
+ * default sandbox (the one behind {@link execute}). See
+ * {@link Sandbox.setResultVariable}.
  *
  * @param name - The variable name to capture
  */
 export function setResultVariable(name: string): Promise<void>;
 
 /**
- * The virtual file tree backing the WASI filesystem.
- *
- * This is the same object passed to `_setFileData()` from the preview2-shim.
- * It contains `python-stdlib` and `site-packages` directories. You can add
- * files to `_fileTree.dir["site-packages"]` and then call `_setFileData(_fileTree)`
- * to make them visible to the sandbox.
+ * The template file tree each new Sandbox copies: `python-stdlib` and an empty
+ * `site-packages` directory. Files added here are visible to sandboxes created
+ * afterwards; change {@link Sandbox._fileTree} to reach one that exists.
  *
  * @internal This is primarily for use by the demo app and advanced integrations.
  */
