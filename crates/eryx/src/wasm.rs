@@ -433,6 +433,10 @@ pub struct ExecutionOutput {
     /// to, so the instance was reset. Reported once, by the first successful
     /// run after the reset; always `false` outside sessions.
     pub state_was_reset: bool,
+    /// Whether trace events or streamed output chunks were dropped because
+    /// the execution reached the per-stream limit (16 MiB of queued events
+    /// each). The captured `stdout`/`stderr` here are unaffected.
+    pub stream_truncated: bool,
 }
 
 impl ExecutionOutput {
@@ -459,6 +463,7 @@ impl ExecutionOutput {
             result: None,
             result_error: None,
             state_was_reset: false,
+            stream_truncated: false,
         }
     }
 
@@ -876,6 +881,206 @@ wasmtime::component::bindgen!({
     },
 });
 
+/// Most bytes kept per stream per execution from direct fd 1/2 writes. These
+/// are streamed once at the end of the execution, on top of
+/// [`STREAM_BYTES_LIMIT`].
+// ponytail: fixed cap, excess dropped; make it a ResourceLimits field if anyone needs more.
+const FD_CAPTURE_LIMIT: usize = 1024 * 1024;
+
+/// Guest stdout/stderr at the WASI level (fds 1 and 2).
+///
+/// Python's `sys.stdout`/`sys.stderr` are captured inside the guest, but
+/// `os.write(1, ...)` and `sys.__stdout__` go straight to the WASI streams.
+/// This collects those bytes instead of passing them to the host's stdio, so
+/// they can be appended to the execution's captured output. At most
+/// [`FD_CAPTURE_LIMIT`] bytes are kept between [`take`](Self::take)s; the
+/// rest is dropped.
+#[derive(Clone, Default)]
+pub(crate) struct FdCapture(Arc<Mutex<Vec<u8>>>);
+
+impl FdCapture {
+    /// Remove and return everything captured so far.
+    pub(crate) fn take(&self) -> Vec<u8> {
+        std::mem::take(
+            &mut *self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    fn push(&self, data: &[u8]) {
+        let mut buf = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let room = FD_CAPTURE_LIMIT.saturating_sub(buf.len());
+        buf.extend_from_slice(&data[..data.len().min(room)]);
+    }
+}
+
+impl wasmtime_wasi::cli::IsTerminal for FdCapture {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl wasmtime_wasi::cli::StdoutStream for FdCapture {
+    fn p2_stream(&self) -> Box<dyn wasmtime_wasi_io::streams::OutputStream> {
+        Box::new(self.clone())
+    }
+
+    fn async_stream(&self) -> Box<dyn tokio::io::AsyncWrite + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+impl wasmtime_wasi_io::streams::OutputStream for FdCapture {
+    fn write(
+        &mut self,
+        bytes: wasmtime_wasi_io::bytes::Bytes,
+    ) -> Result<(), wasmtime_wasi_io::streams::StreamError> {
+        self.push(&bytes);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), wasmtime_wasi_io::streams::StreamError> {
+        Ok(())
+    }
+
+    fn check_write(&mut self) -> Result<usize, wasmtime_wasi_io::streams::StreamError> {
+        Ok(64 * 1024)
+    }
+}
+
+#[async_trait::async_trait]
+impl wasmtime_wasi_io::poll::Pollable for FdCapture {
+    async fn ready(&mut self) {}
+}
+
+impl tokio::io::AsyncWrite for FdCapture {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.push(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// Captures of a guest's fd 1 and fd 2.
+#[derive(Clone, Default)]
+pub(crate) struct FdOutput {
+    pub(crate) stdout: FdCapture,
+    pub(crate) stderr: FdCapture,
+}
+
+impl FdOutput {
+    /// Route the guest's fds 1 and 2 into these captures.
+    pub(crate) fn attach(&self, wasi_builder: &mut WasiCtxBuilder) {
+        wasi_builder
+            .stdout(self.stdout.clone())
+            .stderr(self.stderr.clone());
+    }
+
+    /// Take what was captured since the last call, as `(stdout, stderr)`,
+    /// also sending it to the output stream if one is attached.
+    pub(crate) fn take(
+        &self,
+        output_tx: Option<&mpsc::UnboundedSender<OutputRequest>>,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let streams = (self.stdout.take(), self.stderr.take());
+        if let Some(tx) = output_tx {
+            for (stream, data) in [(0, &streams.0), (1, &streams.1)] {
+                if !data.is_empty() {
+                    let _ = tx.send(OutputRequest {
+                        stream,
+                        data: data.clone(),
+                    });
+                }
+            }
+        }
+        streams
+    }
+}
+
+/// Most bytes one execution may queue for each of the trace and output
+/// streams. The imports that feed them can't wait for a slow consumer, so
+/// anything past this is dropped from the stream (captured stdout/stderr in
+/// the final result are unaffected) and the execution reports
+/// [`ExecutionOutput::stream_truncated`].
+// ponytail: fixed per-execution cap; make it configurable if a consumer needs more.
+pub(crate) const STREAM_BYTES_LIMIT: usize = 16 * 1024 * 1024;
+
+/// What each queued trace event or output chunk is charged on top of its
+/// payload, for its allocation and channel slot. With [`STREAM_BYTES_LIMIT`]
+/// this also caps the number of queued messages per stream.
+const STREAM_MESSAGE_OVERHEAD: usize = 64;
+
+/// What is left of this execution's trace and output stream budgets.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StreamBudget {
+    trace: usize,
+    output: usize,
+    /// Whether anything was dropped for lack of budget.
+    pub(crate) truncated: bool,
+}
+
+impl Default for StreamBudget {
+    fn default() -> Self {
+        Self {
+            trace: STREAM_BYTES_LIMIT,
+            output: STREAM_BYTES_LIMIT,
+            truncated: false,
+        }
+    }
+}
+
+impl StreamBudget {
+    /// Charge one trace event with `payload` bytes; `false` means drop it.
+    fn spend_trace(&mut self, payload: usize) -> bool {
+        Self::spend(&mut self.trace, &mut self.truncated, payload, "trace")
+    }
+
+    /// Charge one output chunk with `payload` bytes; `false` means drop it.
+    fn spend_output(&mut self, payload: usize) -> bool {
+        Self::spend(&mut self.output, &mut self.truncated, payload, "output")
+    }
+
+    fn spend(left: &mut usize, truncated: &mut bool, payload: usize, stream: &str) -> bool {
+        let cost = payload.saturating_add(STREAM_MESSAGE_OVERHEAD);
+        if let Some(rest) = left.checked_sub(cost) {
+            *left = rest;
+            return true;
+        }
+        if *left != 0 {
+            *left = 0;
+            tracing::warn!(
+                stream,
+                limit = STREAM_BYTES_LIMIT,
+                "stream limit reached; dropping further events"
+            );
+        }
+        *truncated = true;
+        false
+    }
+}
+
 /// State for a single execution, implementing WASI and callback channels.
 pub struct ExecutorState {
     /// WASI context for the execution.
@@ -913,6 +1118,8 @@ pub struct ExecutorState {
     /// it and reinstall callbacks only when the declarations change; older
     /// guests use it to skip setup on fresh, callback-free instances.
     pub(crate) reuse_empty_callbacks: bool,
+    /// Remaining trace/output stream bytes for the current execution.
+    pub(crate) stream_budget: StreamBudget,
 }
 
 impl std::fmt::Debug for ExecutorState {
@@ -957,6 +1164,7 @@ impl ExecutorState {
             hybrid_vfs_ctx: None,
             suspended: None,
             reuse_empty_callbacks: true,
+            stream_budget: StreamBudget::default(),
         }
     }
 
@@ -1129,6 +1337,10 @@ impl SandboxImports for ExecutorState {
     /// Report a trace event to the host.
     fn report_trace(&mut self, lineno: u32, event_json: String, context_json: String) {
         if let Some(tx) = &self.trace_tx {
+            let size = event_json.len() + context_json.len();
+            if !self.stream_budget.spend_trace(size) {
+                return;
+            }
             let request = TraceRequest {
                 lineno,
                 event_json,
@@ -1146,6 +1358,9 @@ impl SandboxImports for ExecutorState {
             return;
         }
         if let Some(tx) = &self.output_tx {
+            if data.is_empty() || !self.stream_budget.spend_output(data.len()) {
+                return;
+            }
             let request = OutputRequest {
                 stream: stream_id,
                 data,
@@ -2810,7 +3025,8 @@ impl PythonExecutor {
 
         // Create WASI context with Python stdlib mounts if configured
         let mut wasi_builder = WasiCtxBuilder::new();
-        wasi_builder.inherit_stdout().inherit_stderr();
+        let fd_output = FdOutput::default();
+        fd_output.attach(&mut wasi_builder);
 
         // Build PYTHONPATH from stdlib and all site-packages directories
         // The first site-packages is mounted at /site-packages (for preinit compatibility)
@@ -2944,6 +3160,7 @@ impl PythonExecutor {
             hybrid_vfs_ctx,
             suspended: None,
             reuse_empty_callbacks: true,
+            stream_budget: StreamBudget::default(),
         };
 
         // Set up fuel for tracking/limiting. We use u64::MAX for tracking-only mode
@@ -2954,7 +3171,7 @@ impl PythonExecutor {
             .acquire_store(state, memory_limit, initial_fuel)
             .await?;
 
-        let result = self
+        let mut result = self
             .run_on_store(
                 &mut store,
                 &bindings,
@@ -2965,6 +3182,11 @@ impl PythonExecutor {
                 initial_fuel,
             )
             .await;
+        let (fd_stdout, fd_stderr) = fd_output.take(store.data().output_tx.as_ref());
+        if let Ok(output) = &mut result {
+            output.stdout.extend(fd_stdout);
+            output.stderr.extend(fd_stderr);
+        }
 
         // Teardown (resetting the memory slot) and re-instantiation happen off
         // the request path when the warm pool is active. A failed execution
@@ -3160,6 +3382,7 @@ impl PythonExecutor {
         );
         output.result = empty_to_none(wit_output.result_json);
         output.result_error = empty_to_none(wit_output.result_error);
+        output.stream_truncated = store.data().stream_budget.truncated;
         Ok(output)
     }
 }
