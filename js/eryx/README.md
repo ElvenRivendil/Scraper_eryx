@@ -101,20 +101,23 @@ const sandbox = new Sandbox({
 
 ### Networking
 
-Networking is off by default. Enable it with a host policy (same rules as the Rust crate's `NetConfig`; localhost and private ranges stay blocked unless you override `blockedHosts`, IP addresses are checked against `blockedNetworks`, and in Node.js so are the addresses a name resolves to, with `allowedNetworks` and `internalHosts` as exceptions). At most `maxConnections` (default 10) are open at once, timeouts are capped by `connectTimeoutMs` and `ioTimeoutMs`, and connections are closed when an execution finishes. Browsers resolve names themselves, so a name that points at a private address can't be refused there: use `allowedHosts` rather than `allowAllHosts` in browsers.
+Networking is off by default. Enable it with a host policy (same rules as the Rust crate's `NetConfig`; localhost and private ranges stay blocked unless you override `blockedHosts`, IP addresses are checked against `blockedNetworks`, and in Node.js so are the addresses a name resolves to, with `allowedNetworks` and `internalHosts` as exceptions). At most `maxConnections` (default 10) are open at once, timeouts are capped by `connectTimeoutMs` and `ioTimeoutMs`, and connections are closed when each call into the sandbox finishes. Browsers resolve names themselves, so a name that points at a private address can't be refused there: use `allowedHosts` rather than `allowAllHosts` in browsers.
 
 ```js
 import { Sandbox, setNetConfig } from "@bsull/eryx";
 
-setNetConfig({ allowedHosts: ["api.github.com", "*.example.com"] });
-
-const sandbox = new Sandbox();
+const sandbox = new Sandbox({ netConfig: { allowedHosts: ["api.github.com", "*.example.com"] } });
 await sandbox.execute(`
 import json, urllib.request
 repo = json.load(urllib.request.urlopen("https://api.github.com/repos/eryx-org/eryx"))
 print(repo["stargazers_count"])
 `);
+
+// Or set the default that sandboxes created afterwards start with.
+setNetConfig({ allowedHosts: ["api.github.com"] });
 ```
+
+Each sandbox has its own policy: `netConfig` sets it at creation, and `sandbox.setNetConfig()` replaces it for connections opened afterwards. A sandbox without `netConfig` copies the default from the module-level `setNetConfig()` when it is created, so a later `setNetConfig()` call changes only sandboxes created after it (and the default sandbox behind the module-level `execute()`).
 
 In Node.js, sandboxed code gets real TCP and TLS sockets. Browsers can't open sockets, so there each request is replayed through `fetch()`: only HTTP(S) works, one request per connection, and the server must allow cross-origin requests.
 
@@ -163,9 +166,9 @@ for i in range(5):
 `);
 ```
 
-### Timeouts
+### Timeouts and memory
 
-Nothing interrupts a call by default, so `while True: pass` never returns. Pass `timeoutMs` to run the sandbox in its own Worker (`worker_threads` in Node.js) that is terminated when a call runs too long:
+Timeouts are opt-in in JavaScript. Unlike the Rust crate and the Python bindings, which stop an execution after 30 seconds by default, nothing interrupts a call here unless you ask, so `while True: pass` never returns. Pass `timeoutMs` to run the sandbox in its own Worker (`worker_threads` in Node.js) that is terminated when a call runs too long:
 
 ```js
 import { Sandbox, TimeoutError } from "@bsull/eryx";
@@ -179,6 +182,8 @@ try {
 ```
 
 The call rejects with a `TimeoutError` (or `executeWithJournal()` reports it as `outcome.error`) and the sandbox starts over with fresh Python state. Callbacks, output and networking still run on the creating thread. The Worker costs about 70 MB on top of the sandbox's own memory, and the sandbox's `_fileTree` isn't available. `close()` terminates the Worker at once; otherwise it lives until the sandbox is garbage collected.
+
+There is no memory limit, with or without `timeoutMs` (the Rust crate and the Python bindings cap memory at 128 MB by default). A sandbox's memory grows as its code allocates, up to the WebAssembly 4 GiB maximum or what the JavaScript engine allows, and its in-memory filesystem has no size cap either. Run untrusted code that might allocate without bound in a process you can afford to lose.
 
 ### Node.js and the WASI shims
 
@@ -206,10 +211,11 @@ export default defineConfig({
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `new Sandbox(options?)` | `Sandbox` | Create an isolated sandbox; `options` can set its own `callbackHandler`, `callbacks`, `traceHandler`, `outputHandler` and `timeoutMs` |
+| `new Sandbox(options?)` | `Sandbox` | Create an isolated sandbox; `options` can set its own `callbackHandler`, `callbacks`, `traceHandler`, `outputHandler`, `netConfig` and `timeoutMs` |
 | `execute(code)` | `Promise<{ stdout, stderr }>` | Run Python code |
 | `executeWithJournal(code, { journal? })` | `Promise<ReplayOutcome>` | Run with callback journaling/replay |
 | `setResultVariable(name)` | `Promise<void>` | Change the captured result variable |
+| `setNetConfig(config)` | `void` | Replace this sandbox's network policy (`null` disables networking) |
 | `close()` | `void` | Close connections, stop a `timeoutMs` Worker, reject later calls (also `using`) |
 | `snapshotState()` | `Promise<Uint8Array>` | Serialize interpreter state |
 | `restoreState(data)` | `Promise<void>` | Restore from snapshot |

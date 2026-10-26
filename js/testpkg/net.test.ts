@@ -3,13 +3,14 @@ import { createServer, type Server, type Socket } from "node:net";
 import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { gzipSync } from "node:zlib";
+import { readFileSync } from "node:fs";
 import { Sandbox, setNetConfig } from "@bsull/eryx";
 // The browser transport, exercised directly: Node has fetch() but no CORS.
 // @ts-expect-error -- untyped internal module
 import { createTransport as createFetchTransport, networkFilter as fetchNetworkFilter } from "../eryx/shims/net-fetch.js";
 // @ts-expect-error -- untyped internal module
-import { createTransport as createNodeTransport } from "../eryx/shims/net-node.js";
-import { DEFAULT_BLOCKED_NETWORKS } from "@bsull/eryx";
+import { createTransport as createNodeTransport, networkFilter as nodeNetworkFilter } from "../eryx/shims/net-node.js";
+import { DEFAULT_BLOCKED_HOSTS, DEFAULT_BLOCKED_NETWORKS } from "@bsull/eryx";
 import { createNet } from "@bsull/eryx/shims/net";
 
 const { tcp: fetchTcp } = createFetchTransport();
@@ -24,33 +25,33 @@ const allowLoopback = {
 };
 
 describe("network policy", () => {
-  afterEach(() => setNetConfig(null));
+  afterEach(() => sandbox.setNetConfig(null));
 
-  const tryConnect = (host: string) =>
-    sandbox.execute(`
+  const probe = (host: string) => `
 import socket
 try:
     socket.create_connection(("${host}", 9))
 except OSError as e:
     print(e)
-`);
+`;
+  const tryConnect = (host: string) => sandbox.execute(probe(host));
 
   it("is disabled by default", async () => {
     expect((await tryConnect("example.com")).stdout).toContain("networking is disabled");
   });
 
   it("refuses hosts outside the allowlist", async () => {
-    setNetConfig({ allowedHosts: ["*.example.com"] });
+    sandbox.setNetConfig({ allowedHosts: ["*.example.com"] });
     expect((await tryConnect("example.org")).stdout).toContain("not in allowed list");
   });
 
   it("blocks private hosts even with allowAllHosts", async () => {
-    setNetConfig({ allowAllHosts: true });
+    sandbox.setNetConfig({ allowAllHosts: true });
     expect((await tryConnect("127.0.0.1")).stdout).toContain("is blocked");
   });
 
   it("blocks private addresses that pass the host patterns", async () => {
-    setNetConfig({ allowAllHosts: true, blockedHosts: [] });
+    sandbox.setNetConfig({ allowAllHosts: true, blockedHosts: [] });
     expect((await tryConnect("127.0.0.1")).stdout).toContain("resolves to a blocked network");
     // A name is checked by what it resolves to, not how it is spelled.
     expect((await tryConnect("localhost")).stdout).toContain("resolves to a blocked network");
@@ -59,7 +60,7 @@ except OSError as e:
   });
 
   it("matches hosts in their URL form", async () => {
-    setNetConfig({ allowAllHosts: true });
+    sandbox.setNetConfig({ allowAllHosts: true });
     // Both spell 127.0.0.1, which `127.*` blocks.
     expect((await tryConnect("2130706433")).stdout).toContain("is blocked");
     expect((await tryConnect("0x7f.1")).stdout).toContain("is blocked");
@@ -69,18 +70,96 @@ except OSError as e:
   });
 
   it("matches allowedHosts against the URL form only", async () => {
-    setNetConfig({ allowedHosts: ["0x7f.1"], blockedHosts: [] });
+    sandbox.setNetConfig({ allowedHosts: ["0x7f.1"], blockedHosts: [] });
     expect((await tryConnect("0x7f.1")).stdout).toContain("not in allowed list");
   });
 
   it("rejects malformed CIDRs up front", () => {
     // `Number("")` is 0: unchecked, this would exempt every IPv4 address.
-    expect(() => setNetConfig({ allowedNetworks: ["10.0.0.0/"] })).toThrow("invalid CIDR '10.0.0.0/'");
-    expect(() => setNetConfig({ blockedNetworks: ["10.0.0.0/33"] })).toThrow(TypeError);
-    expect(() => setNetConfig({ blockedNetworks: ["not-an-ip/8"] })).toThrow();
+    expect(() => sandbox.setNetConfig({ allowedNetworks: ["10.0.0.0/"] })).toThrow("invalid CIDR '10.0.0.0/'");
+    expect(() => sandbox.setNetConfig({ blockedNetworks: ["10.0.0.0/33"] })).toThrow(TypeError);
+    expect(() => sandbox.setNetConfig({ blockedNetworks: ["not-an-ip/8"] })).toThrow();
+    expect(() => sandbox.setNetConfig({ maxConnections: -1 })).toThrow(TypeError);
+    expect(() => sandbox.setNetConfig({ maxConnections: NaN })).toThrow(TypeError);
     expect(() => setNetConfig({ maxConnections: -1 })).toThrow(TypeError);
-    expect(() => setNetConfig({ maxConnections: NaN })).toThrow(TypeError);
+    expect(() => new Sandbox({ netConfig: { blockedNetworks: ["10.0.0.0/33"] } })).toThrow(TypeError);
   });
+
+  it("copies the config it is given", async () => {
+    const allowedHosts = ["*.example.com"];
+    const blockedHosts = ["*.example.com"];
+    const own = new Sandbox({ netConfig: { allowedHosts } });
+    sandbox.setNetConfig({ allowAllHosts: true, blockedHosts });
+    try {
+      allowedHosts.push("example.org");
+      blockedHosts.length = 0;
+      expect((await own.execute(probe("example.org"))).stdout).toContain("not in allowed list");
+      expect((await tryConnect("api.example.com")).stdout).toContain("is blocked");
+      // The defaults can't be changed either.
+      expect(() => (DEFAULT_BLOCKED_HOSTS as string[]).push("example.org")).toThrow(TypeError);
+      expect(() => (DEFAULT_BLOCKED_NETWORKS as string[]).pop()).toThrow(TypeError);
+    } finally {
+      own.close();
+    }
+  });
+
+  it("gives each sandbox its own policy", async () => {
+    const own = new Sandbox({ netConfig: { allowedHosts: ["*.example.com"] } });
+    try {
+      // A later default doesn't reach sandboxes that already exist.
+      setNetConfig({ allowAllHosts: true });
+      expect((await tryConnect("example.org")).stdout).toContain("networking is disabled");
+      // ...but new sandboxes start with it.
+      const later = new Sandbox();
+      try {
+        expect((await later.execute(probe("127.0.0.1"))).stdout).toContain("is blocked");
+      } finally {
+        later.close();
+      }
+      // Replacing one sandbox's policy leaves the others alone.
+      expect((await own.execute(probe("example.org"))).stdout).toContain("not in allowed list");
+      own.setNetConfig(null);
+      expect((await own.execute(probe("example.org"))).stdout).toContain("networking is disabled");
+    } finally {
+      setNetConfig(null);
+      own.close();
+    }
+  });
+});
+
+describe("default blocked networks", () => {
+  const filters = {
+    node: nodeNetworkFilter,
+    browser: fetchNetworkFilter,
+  } as Record<string, (c: object) => (address: string, family: number) => boolean>;
+
+  it("has as many ranges as the Rust crate's list", () => {
+    const rust = readFileSync(new URL("../../crates/eryx/src/net.rs", import.meta.url), "utf8");
+    const len = /pub const DEFAULT_BLOCKED_NETWORKS: \[IpNet; (\d+)\]/.exec(rust)?.[1];
+    expect(DEFAULT_BLOCKED_NETWORKS.length).toBe(Number(len));
+  });
+
+  for (const [name, filter] of Object.entries(filters)) {
+    it(`blocks the non-public ranges (${name})`, () => {
+      const isAllowed = filter({ blockedNetworks: DEFAULT_BLOCKED_NETWORKS, allowedNetworks: [] });
+      for (const v4 of ["192.0.0.8", "198.18.0.1", "198.19.255.255"]) expect(isAllowed(v4, 4), v4).toBe(false);
+      for (const v6 of ["::1.2.3.4", "2001::1", "2001:db8::1", "2002:c000:204::1", "64:ff9b:1::1", "fec0::1"]) {
+        expect(isAllowed(v6, 6), v6).toBe(false);
+      }
+      expect(isAllowed("93.184.215.14", 4)).toBe(true);
+      expect(isAllowed("2606:2800:21f:cb07:6820:80da:af6b:8b2c", 6)).toBe(true);
+    });
+
+    it(`checks IPv6 addresses by the IPv4 address they embed (${name})`, () => {
+      const isAllowed = filter({ blockedNetworks: ["169.254.0.0/16"], allowedNetworks: [] });
+      // IPv4-mapped, IPv4-compatible, NAT64 and Teredo (inverted) forms of 169.254.169.254.
+      for (const v6 of ["::ffff:a9fe:a9fe", "::a9fe:a9fe", "64:ff9b::a9fe:a9fe", "2001:0:1:2:3:4:5601:5601"]) {
+        expect(isAllowed(v6, 6), v6).toBe(false);
+      }
+      expect(isAllowed("2001:0:1:2:3:4:a9fe:a9fe", 6)).toBe(true);
+      expect(isAllowed("2606::a9fe:a9fe", 6)).toBe(true);
+    });
+  }
 });
 
 describe("Node socket transport", () => {
@@ -91,7 +170,7 @@ describe("Node socket transport", () => {
   const open = new Set<Socket>();
 
   beforeAll(async () => {
-    setNetConfig(allowLoopback);
+    sandbox.setNetConfig(allowLoopback);
     // Upper-cases what it receives after a delay, so the host-side read
     // genuinely has to suspend. Says nothing until spoken to.
     server = createServer((sock) => {
@@ -104,12 +183,12 @@ describe("Node socket transport", () => {
   });
 
   afterAll(() => {
-    setNetConfig(null);
+    sandbox.setNetConfig(null);
     server.close();
   });
 
   it("lets internalHosts resolve to blocked networks", async () => {
-    setNetConfig({ allowAllHosts: true, blockedHosts: [], internalHosts: ["localhost"] });
+    sandbox.setNetConfig({ allowAllHosts: true, blockedHosts: [], internalHosts: ["localhost"] });
     try {
       const result = await sandbox.execute(`
 import socket
@@ -120,7 +199,7 @@ s.close()
 `);
       expect(result.stdout).toBe("INTERNAL\n");
     } finally {
-      setNetConfig(allowLoopback);
+      sandbox.setNetConfig(allowLoopback);
     }
   });
 
@@ -136,7 +215,7 @@ s.close()
   });
 
   it("times out reads, capped by ioTimeoutMs", async () => {
-    setNetConfig({ ...allowLoopback, ioTimeoutMs: 200 });
+    sandbox.setNetConfig({ ...allowLoopback, ioTimeoutMs: 200 });
     try {
       const result = await sandbox.execute(`
 import socket
@@ -151,7 +230,7 @@ for timeout in (0.1, None, 600):
 `);
       expect(result.stdout).toBe("TimeoutError\nTimeoutError\nTimeoutError\n");
     } finally {
-      setNetConfig(allowLoopback);
+      sandbox.setNetConfig(allowLoopback);
     }
   });
 
@@ -165,6 +244,7 @@ conns = [socket.create_connection(("127.0.0.1", ${port})) for _ in range(3)]
 
   it("keeps each instance's connections to itself", async () => {
     const [a, b] = [createNet(), createNet()];
+    a.setNetConfig(allowLoopback);
     const h = await a.tcp.connect("127.0.0.1", port, 0);
     await expect(b.tcp.read(h, 10, 0)).rejects.toEqual({ payload: { tag: "invalid-handle" } });
     b.closeConnections();
@@ -182,6 +262,7 @@ conns = [socket.create_connection(("127.0.0.1", ${port})) for _ in range(3)]
     silent.on("connection", (sock) => sock.resume().on("close", () => (peerClosed = true)));
     try {
       const net = createNet();
+      net.setNetConfig(allowLoopback);
       const h = await net.tcp.connect("127.0.0.1", (silent.address() as AddressInfo).port, 0);
       const handshake = net.tls.upgrade(h, "example.com", 0);
       net.closeConnections();
@@ -193,7 +274,7 @@ conns = [socket.create_connection(("127.0.0.1", ${port})) for _ in range(3)]
   });
 
   it("caps open connections at maxConnections", async () => {
-    setNetConfig({ ...allowLoopback, maxConnections: 2 });
+    sandbox.setNetConfig({ ...allowLoopback, maxConnections: 2 });
     try {
       const result = await sandbox.execute(`
 import socket
@@ -211,12 +292,12 @@ print("ok")
 `);
       expect(result.stdout).toMatch(/^2 .*connection limit reached \(2\)\nok\n$/);
     } finally {
-      setNetConfig(allowLoopback);
+      sandbox.setNetConfig(allowLoopback);
     }
   });
 
   it("treats maxConnections 0 as no limit", async () => {
-    setNetConfig({ ...allowLoopback, maxConnections: 0 });
+    sandbox.setNetConfig({ ...allowLoopback, maxConnections: 0 });
     try {
       const result = await sandbox.execute(`
 import socket
@@ -225,7 +306,7 @@ print(len(conns))
 `);
       expect(result.stdout).toBe("12\n");
     } finally {
-      setNetConfig(allowLoopback);
+      sandbox.setNetConfig(allowLoopback);
     }
   });
 
@@ -354,7 +435,7 @@ describe("Python HTTP clients over eryx:net", () => {
   let requestedPath: string | undefined;
 
   beforeAll(async () => {
-    setNetConfig(allowLoopback);
+    sandbox.setNetConfig(allowLoopback);
     server = createHttpServer((req, res) => {
       requestedPath = req.url;
       res.end("hello from the host");
@@ -364,7 +445,7 @@ describe("Python HTTP clients over eryx:net", () => {
   });
 
   afterAll(() => {
-    setNetConfig(null);
+    sandbox.setNetConfig(null);
     server.close();
   });
 

@@ -14,7 +14,7 @@
  */
 
 import { createCallbackHost } from "./shims/callbacks.js";
-import { createNet } from "./shims/net.js";
+import { createNet, setNetConfig as setDefaultNetConfig } from "./shims/net.js";
 import {
   _fileTree,
   decodeError,
@@ -182,8 +182,8 @@ export {
   SuspendCallback,
 } from "./shims/callbacks.js";
 
-// Re-export network policy configuration
-export { setNetConfig, DEFAULT_BLOCKED_HOSTS, DEFAULT_BLOCKED_NETWORKS } from "./shims/net.js";
+// Re-export network policy defaults
+export { DEFAULT_BLOCKED_HOSTS, DEFAULT_BLOCKED_NETWORKS } from "./shims/net.js";
 
 /**
  * Result from executing Python code in the sandbox.
@@ -269,6 +269,9 @@ function _toResult(output) {
  * @property {Array<{name: string, description: string, parametersSchemaJson?: string}>} [callbacks]
  * @property {((lineno: number, eventJson: string, contextJson: string) => void) | null} [traceHandler]
  * @property {((stream: number, data: string) => void) | null} [outputHandler]
+ * @property {import("./shims/net.js").NetConfig | null} [netConfig] - This
+ *   sandbox's network policy (`null` disables networking). Omitted, the
+ *   sandbox copies the default set with {@link setNetConfig} at creation.
  * @property {number} [timeoutMs] - Run the sandbox in its own Worker and
  *   reject any call that takes longer than this many milliseconds with a
  *   {@link TimeoutError}. The Worker is then terminated and replaced, so the
@@ -344,6 +347,7 @@ export class Sandbox {
      */
     this._fileTree = timeoutMs === undefined ? forkTree(_fileTree) : undefined;
     this.#host = createCallbackHost(options);
+    if (options.netConfig !== undefined) this.#net.setNetConfig(options.netConfig);
     if (timeoutMs !== undefined) _workerReaper.register(this, this.#slot, this.#slot);
     this.#start();
   }
@@ -381,15 +385,34 @@ export class Sandbox {
   }
 
   /**
+   * Replace this sandbox's network policy (`null` disables networking). It
+   * applies to connections opened after the call, and doesn't change the
+   * default set with the module-level {@link setNetConfig} or other sandboxes.
+   *
+   * Throws a TypeError if a network isn't a valid CIDR or `maxConnections`
+   * isn't a non-negative integer.
+   *
+   * @param {import("./shims/net.js").NetConfig | null} netConfig
+   */
+  setNetConfig(netConfig) {
+    this.#net.setNetConfig(netConfig);
+  }
+
+  /**
    * Run `fn` on the instance once every call queued before it has settled.
    * @template T
    * @param {(instance: any) => Promise<T>} fn
    * @returns {Promise<T>}
    */
   #serialized(fn) {
-    const run = this.#queue.then(() => {
+    const run = this.#queue.then(async () => {
       if (this.#slot.closed) throw this.#slot.closed;
-      return this.#call(fn);
+      try {
+        return await this.#call(fn);
+      } finally {
+        // Connections don't outlive the call that opened them.
+        this.#net.closeConnections();
+      }
     });
     this.#queue = run.catch(() => {});
     return run;
@@ -432,8 +455,6 @@ export class Sandbox {
       return _toResult(await instance.execute(`#eryx-preamble:0\n${code}`));
     } finally {
       this.#host.flushOutput();
-      // Connections don't outlive the execution that opened them.
-      this.#net.closeConnections();
     }
   }
 
@@ -565,6 +586,22 @@ let _defaultSandbox;
 /** The sandbox behind the module-level helpers, created on first use. */
 function _default() {
   return (_defaultSandbox ??= new Sandbox());
+}
+
+/**
+ * Set the default network policy (`null` disables networking, the initial
+ * default). Each Sandbox copies it when it is created, unless given its own
+ * `netConfig`; sandboxes that already exist keep their policy. It also
+ * applies to the default sandbox behind the module-level helpers.
+ *
+ * Throws a TypeError if a network isn't a valid CIDR or `maxConnections`
+ * isn't a non-negative integer.
+ *
+ * @param {import("./shims/net.js").NetConfig | null} netConfig
+ */
+export function setNetConfig(netConfig) {
+  setDefaultNetConfig(netConfig);
+  _defaultSandbox?.setNetConfig(netConfig);
 }
 
 /**
