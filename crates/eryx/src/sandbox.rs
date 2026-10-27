@@ -11,8 +11,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::CancellationToken;
 use tokio::sync::{mpsc, oneshot};
-use tokio_util::sync::CancellationToken;
 
 use crate::replay::{CallbackJournal, ReplayState, SuspendedCallback, wrap_callbacks};
 
@@ -1863,17 +1863,9 @@ impl<R, S> SandboxBuilder<R, S> {
         allowed_hosts: Vec<String>,
     ) -> Self {
         let name = name.into();
-        let value = value.into();
-        let placeholder = crate::secrets::generate_placeholder(&name);
-
-        self.secrets.insert(
-            name.clone(),
-            crate::secrets::SecretConfig {
-                real_value: value,
-                placeholder: placeholder.clone(),
-                allowed_hosts,
-            },
-        );
+        let secret = crate::secrets::SecretConfig::new(value, allowed_hosts);
+        let placeholder = secret.placeholder().to_string();
+        self.secrets.insert(name.clone(), secret);
 
         // Set the placeholder as an environment variable via the preamble. The
         // preinitialized runtime snapshots `os.environ`, so WASI env vars set
@@ -2239,6 +2231,7 @@ impl SandboxBuilder<state::Has, state::Has> {
     pub fn build(mut self) -> Result<Sandbox, Error> {
         check_duplicate_callback(self.duplicate_callback.take())?;
         if let Some(net) = &self.net_config {
+            net.validate().map_err(Error::Initialization)?;
             net.check_secret_hosts(&self.secrets)
                 .map_err(Error::Initialization)?;
         }
@@ -2587,6 +2580,7 @@ impl SandboxBuilder<state::Has, state::Has> {
 /// [`result`](Self::result) is an error or the run suspended — so a later
 /// resubmission can replay every callback that completed.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct ReplayOutcome {
     /// The execution result, exactly as [`Sandbox::execute`] would return it.
     ///

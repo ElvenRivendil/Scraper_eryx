@@ -53,6 +53,7 @@
 pub mod cache;
 mod callback;
 pub mod callback_handler;
+mod cancel;
 #[cfg(feature = "embedded")]
 pub mod embedded;
 #[cfg(feature = "embedded-stdlib")]
@@ -124,8 +125,7 @@ pub use sandbox::{
     SandboxBuilder, state,
 };
 pub use secrets::{
-    FileScrubPolicy, OutputScrubPolicy, SecretConfig, generate_placeholder, scrub_placeholders,
-    scrub_placeholders_bytes,
+    FileScrubPolicy, OutputScrubPolicy, SecretConfig, scrub_placeholders, scrub_placeholders_bytes,
 };
 pub use session::{
     InProcessSession, PythonStateSnapshot, Session, SessionExecutor, SnapshotMetadata,
@@ -136,15 +136,14 @@ pub use trace::{OutputHandler, TraceEvent, TraceEventKind, TraceHandler};
 
 // Re-export precompilation utilities and internal types
 pub use wasm::{
-    CallbackRequest, CpuFeatureLevel, ExecutionOutput, NetRequest, OutputRequest, PythonExecutor,
-    STREAM_BYTES_LIMIT, TraceRequest,
+    CallbackHostResult, CallbackRequest, CpuFeatureLevel, ExecutionOutput, NetRequest,
+    OutputRequest, PythonExecutor, STREAM_BYTES_LIMIT, TraceRequest,
 };
 
 // Re-export schema types at top level for convenience
 pub use schema::{JsonSchema, Schema};
 
-// Re-export CancellationToken for convenient use with execute_cancellable
-pub use tokio_util::sync::CancellationToken;
+pub use cancel::CancellationToken;
 
 // Re-export the callback proc macro when the macros feature is enabled
 #[cfg(feature = "macros")]
@@ -163,6 +162,13 @@ pub use eryx_macros::callback;
 ///
 /// VFS is available on `SessionExecutor` for persistent file storage across
 /// multiple executions within a session.
+///
+/// # Stability
+///
+/// This module is **not covered by eryx's semver guarantees**. It re-exports
+/// types from `eryx-vfs`, some of which wrap `wasmtime-wasi` types, and those
+/// change with every wasmtime major release. Items here may change in any
+/// minor or patch release.
 ///
 /// # Example
 ///

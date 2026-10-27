@@ -31,8 +31,8 @@ use std::time::Duration;
 #[cfg(feature = "embedded")]
 use crate::cache::{CacheKey, InstancePreCache};
 
+use crate::CancellationToken;
 use tokio::sync::{mpsc, oneshot};
-use tokio_util::sync::CancellationToken;
 use wasmtime::component::{Accessor, Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{
     AsContextMut, Config, Enabled, Engine, InstanceAllocationStrategy, PoolingAllocationConfig,
@@ -263,6 +263,7 @@ pub enum CallbackHostResult {
 
 /// Request to invoke a callback from Python code.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct CallbackRequest {
     /// Name of the callback to invoke.
     pub name: String,
@@ -270,6 +271,23 @@ pub struct CallbackRequest {
     pub arguments_json: String,
     /// Channel to send the response back.
     pub response_tx: oneshot::Sender<CallbackHostResult>,
+}
+
+impl CallbackRequest {
+    /// A request to invoke callback `name` with `arguments_json`, answered on
+    /// `response_tx`. Useful for testing a callback handler.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        arguments_json: impl Into<String>,
+        response_tx: oneshot::Sender<CallbackHostResult>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            arguments_json: arguments_json.into(),
+            response_tx,
+        }
+    }
 }
 
 /// Request to report a trace event from Python code.
@@ -285,11 +303,24 @@ pub struct TraceRequest {
 
 /// Request to stream output from Python code in real-time.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct OutputRequest {
     /// Stream identifier: 0 = stdout, 1 = stderr.
     pub stream: u32,
     /// The raw bytes that were written.
     pub data: Vec<u8>,
+}
+
+impl OutputRequest {
+    /// A chunk of output `data` on `stream` (0 = stdout, 1 = stderr). Useful
+    /// for testing an output handler.
+    #[must_use]
+    pub fn new(stream: u32, data: impl Into<Vec<u8>>) -> Self {
+        Self {
+            stream,
+            data: data.into(),
+        }
+    }
 }
 
 /// Request for a network operation from Python code.
