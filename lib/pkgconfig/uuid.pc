@@ -1,0 +1,11 @@
+prefix=/home/fx/Scraper/NauTrader_Helm/eryx
+exec_prefix=/home/fx/Scraper/NauTrader_Helm/eryx
+libdir=/home/fx/Scraper/NauTrader_Helm/eryx/lib
+includedir=/home/fx/Scraper/NauTrader_Helm/eryx/include
+
+Name: uuid
+Description: Universally unique id library
+Version: 2.32.1
+Requires:
+Cflags: -I${includedir}/uuid
+Libs: -L${libdir} -luuid
