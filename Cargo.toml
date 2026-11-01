@@ -67,6 +67,7 @@ tonic-prost-build = "0.14"
 tracing = "0.1"
 tracing-error = "0.2"
 tracing-opentelemetry = "0.34"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry", "std"] }
 uuid = "1"
 walkdir = "2.5"
 wasm-bindgen = "0.2"    # browser WASM bindings

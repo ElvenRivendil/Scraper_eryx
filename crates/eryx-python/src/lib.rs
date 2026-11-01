@@ -23,6 +23,7 @@ mod resource_limits;
 mod result;
 mod sandbox;
 mod session;
+mod telemetry;
 mod vfs;
 
 use pyo3::prelude::*;
@@ -68,6 +69,10 @@ fn _eryx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pool::SandboxPool>()?;
     m.add_class::<pool::PooledSandbox>()?;
     m.add_class::<pool::PoolStats>()?;
+
+    // Register telemetry functions
+    m.add_function(wrap_pyfunction!(telemetry::init_telemetry, m)?)?;
+    m.add_function(wrap_pyfunction!(telemetry::shutdown_telemetry, m)?)?;
 
     // Register exceptions
     error::register_exceptions(m)?;

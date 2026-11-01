@@ -42,6 +42,8 @@ from eryx._eryx import (
     Session,
     SuspendedCallback,
     VfsStorage,
+    init_telemetry,
+    shutdown_telemetry,
     # Exceptions
     EryxError,
     ExecutionError,
@@ -73,6 +75,8 @@ __all__ = [
     "Session",
     "SuspendedCallback",
     "VfsStorage",
+    "init_telemetry",
+    "shutdown_telemetry",
     # Exceptions
     "EryxError",
     "ExecutionError",
